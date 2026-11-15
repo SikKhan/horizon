@@ -295,6 +295,7 @@ mod displace;
 mod frame_policy;
 pub mod lightning;
 mod linear_blend;
+pub mod ray_lights;
 #[cfg(test)]
 use frame_policy::frame_format;
 use frame_policy::{frame_configuration, hand_depth_store, horizon_tone_curve, overlay_format};
@@ -7008,7 +7009,9 @@ impl Renderer {
             Vec<(String, f64)>,
             Vec<(u32, u32)>,
             Vec<(u32, u32)>,
-            block_light::LightTable,
+            // The `[[lights]]` colours, and every light source for rays that aim at them
+            // (`NativePack::new`).
+            (block_light::LightTable, block_light::LightTable),
         )>,
     ) -> std::result::Result<Vec<String>, String> {
         let linear = pack.is_some();

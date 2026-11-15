@@ -13,8 +13,8 @@ use crate::inputs::{COMPUTE_INPUT, DISPLACEMENT_INPUT, Frame, RAY_HIT};
 use crate::manifest::{OptionKind, PackOption};
 use crate::package::Pack;
 use crate::stages::{
-    Composed, GROUP, RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING, RAY_SCENE_BINDING,
-    StageKind, compose_traced, identifiers,
+    Composed, GROUP, RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING, RAY_LIGHTS_BINDING,
+    RAY_SCENE_BINDING, StageKind, compose_traced, identifiers,
 };
 use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};
 use std::collections::HashSet;
@@ -92,6 +92,18 @@ impl CheckedStage {
                 g.binding
                     .as_ref()
                     .is_some_and(|b| b.group == GROUP && b.binding == RAY_ENTITY_STORE_BINDING)
+            })
+        })
+    }
+
+    /// Whether the stage against the scene reads the light sources: its pack's files name them
+    /// (`names_ray_lights`), so the renderer keeps and binds their list for it.
+    pub fn traces_lights(&self) -> bool {
+        self.scene.as_ref().is_some_and(|module| {
+            module.global_variables.iter().any(|(_, g)| {
+                g.binding
+                    .as_ref()
+                    .is_some_and(|b| b.group == GROUP && b.binding == RAY_LIGHTS_BINDING)
             })
         })
     }
@@ -551,12 +563,13 @@ fn vertex_rays(
     composed: &Composed,
     manifest: &crate::manifest::Manifest,
 ) -> Vec<Problem> {
-    // The entity layer's bindings come last.
+    // The entity layer's bindings come last, then the light sources'.
     let scene: Vec<_> = (module.global_variables.iter())
         .filter(|(_, g)| {
             g.binding.as_ref().is_some_and(|b| {
                 let bindings = RAY_SCENE_BINDING..=RAY_ENTITY_RETAINED_BINDING;
-                b.group == GROUP && bindings.contains(&b.binding)
+                let lights = b.binding == RAY_LIGHTS_BINDING;
+                b.group == GROUP && (bindings.contains(&b.binding) || lights)
             })
         })
         .map(|(handle, _)| handle)

@@ -13,8 +13,8 @@ use crate::manifest::{
 use crate::package::{MAX_TOTAL, MAX_WGSL};
 use crate::stages::{
     GROUP, KEPT_BINDING, MOTION_BINDING, PBR_NORMALS_BINDING, PBR_SPECULAR_BINDING,
-    RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING, RAY_SCENE_BINDING, RAY_SPRITE_ARRAYS,
-    RAY_SPRITES_BINDING, StageKind,
+    RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING, RAY_LIGHTS_BINDING, RAY_SCENE_BINDING,
+    RAY_SPRITE_ARRAYS, RAY_SPRITES_BINDING, StageKind,
 };
 
 fn table(s: &Struct, offsets: Option<&[usize]>) -> String {
@@ -118,7 +118,8 @@ fn ray_tracing() -> String {
         "### Ray tracing\n\n\
          With `[ray_tracing]` in the manifest (it has no keys, and needs a `[[post]]` pass, a `[[before_world]]` pass or a\n\
          `[material]` stage) the post stage's prelude also has `RayHit` and the functions and constants below, so do the\n\
-         material, compute and `[[before_world]]` stages' where their files name one of the four trace functions, and the\n\
+         material, compute and `[[before_world]]` stages' where their files name one of the four trace functions (or a\n\
+         light function, below), and the\n\
          `Frame` of every stage of the pack has `has_ray_tracing` and `ray_distance`. A pack without the key has none of\n\
          them, and a material, compute or `[[before_world]]` stage that names no trace function is built as without it.\n\n\
          The game traces for the pack picked when it starts: only then, and only for a pack with `[ray_tracing]`, does it\n\
@@ -149,7 +150,15 @@ fn ray_tracing() -> String {
          packs' LabPBR maps at the hit, its sprite's texel at `hit.uv` at full size, as `block_normal_map_level(uv, 0.0)`\n  \
          and `block_specular_map_level(uv, 0.0)` read a drawn surface's; their defaults without maps, and on a miss.\n\
          - In the post, compute and `[[before_world]]` stages, `fn block_pbr_maps() -> bool`: whether the resource packs\n  \
-         ship LabPBR maps, as the material stage's.\n\n\
+         ship LabPBR maps, as the material stage's.\n\
+         - The light sources, only in a pack whose files name one of these five, outside a comment: `struct RayLight`\n  \
+         (`position`, the centre of its block, camera-relative; `level`, its light level 1 to 15; `color`, its `[[lights]]`\n  \
+         colour, white for a block the pack gives none; `state`, its block state), `fn ray_light_count() -> u32` and\n  \
+         `fn ray_light(i: u32) -> RayLight`: every block that gives off light within the grid, the nearest the camera first,\n  \
+         at most 1024; `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources that reach a camera-relative\n  \
+         point, as the first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads (the grid's cells are 8\n  \
+         blocks, 16 a side around the camera, each listing at most 24, the strongest there first; none outside it). The\n  \
+         list only says where sources are: trace towards one (`trace_any`) to know whether its light gets through.\n\n\
          A ray starts at `origin` itself, so move a point off its own surface before tracing from it. What stops it is what\n\
          the surface's own pass draws. In the solid layer it passes through the clear texels of a cut-out texture (leaves,\n\
          plants), as terrain's alpha test does: a texel stops it from alpha 0.5 up. In the translucent layer every texel\n\
@@ -172,7 +181,8 @@ fn ray_tracing() -> String {
     out += &table(&RAY_HIT, None);
     out += &format!(
         "Bindings {RAY_SCENE_BINDING} to {} of group {GROUP} hold the scene while the game traces ({RAY_ENTITY_STORE_BINDING} to\n\
-         {RAY_ENTITY_RETAINED_BINDING} the entity layer, for a pack that names it), and in a post, compute or `[[before_world]]` pass bindings\n\
+         {RAY_ENTITY_RETAINED_BINDING} the entity layer, for a pack that names it, {RAY_LIGHTS_BINDING} the light sources, for a pack that\n\
+         names them), and in a post, compute or `[[before_world]]` pass bindings\n\
          {PBR_NORMALS_BINDING} and {PBR_SPECULAR_BINDING} the LabPBR maps (the material stage has them there already). They are Horizon's, as their\n\
          `horizon_` names say, and change with the renderer.\n\n",
         RAY_SPRITES_BINDING + RAY_SPRITE_ARRAYS - 1

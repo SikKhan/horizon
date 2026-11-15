@@ -181,20 +181,24 @@ impl NativePack {
     /// The pack of the checked stages `report` with the option values `constants`, drawing
     /// onto the world's targets as `terrain` describes; the sky reads the terrain's group 0.
     /// Also returns its stages' labels, in the order they draw. Errors name the stage wgpu
-    /// refused.
+    /// refused. `lights` holds the `[[lights]]` colours of the block states they name,
+    /// `sources` every light-giving state, for rays that aim at light sources.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         terrain: &TerrainShape<'_>,
         report: Report,
         constants: &[(String, f64)],
-        lights: super::block_light::LightTable,
+        (lights, sources): (
+            super::block_light::LightTable,
+            super::block_light::LightTable,
+        ),
     ) -> Result<(Self, Vec<String>), String> {
         // A backend may refuse a layout or pipeline the pack asks for (a stage's bindings
         // past its sampled-texture limit, say, as OpenGL's 16 was before #10095): the pack
         // is refused with that error instead of a validation panic in the renderer.
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let built = Self::build(device, queue, terrain, report, constants, lights);
+        let built = Self::build(device, queue, terrain, report, constants, (lights, sources));
         let refused = pollster::block_on(scope.pop());
         match (built, refused) {
             (Ok(built), None) => Ok(built),
@@ -209,7 +213,10 @@ impl NativePack {
         terrain: &TerrainShape<'_>,
         report: Report,
         constants: &[(String, f64)],
-        lights: super::block_light::LightTable,
+        (lights, sources): (
+            super::block_light::LightTable,
+            super::block_light::LightTable,
+        ),
     ) -> Result<(Self, Vec<String>), String> {
         let (globals, format) = (terrain.globals, terrain.format);
         let kept = super::native_post::kept::Signature::of(&report, constants);
@@ -230,6 +237,10 @@ impl NativePack {
             terrain.pbr,
             terrain.linear,
         );
+        // Rays that aim at light sources read them from any stage.
+        if report.stages.iter().any(CheckedStage::traces_lights) {
+            frame.ray_lights = Some(super::ray_lights::RayLights::new(device, sources));
+        }
         let reach = report.manifest.kept.reach;
         frame.epochs = (kept.as_ref()).map(|_| super::native_post::kept::Epochs::new(reach));
         // `[displacement]`, unless its option is off; nothing to displace without heights.
@@ -372,6 +383,9 @@ impl NativePack {
         // compute passes keep theirs (`ComputePass::scene`). Whether any of them, compute and
         // before-world passes included, reads the entity layer.
         let entities = post.iter().any(CheckedStage::traces_entities);
+        let lights = (post.iter().any(CheckedStage::traces_lights))
+            .then(|| frame.ray_lights.as_ref().map(|l| l.buffer.clone()))
+            .flatten();
         let scenes: Vec<(String, naga::Module)> = (post.iter_mut())
             .filter(|s| s.kind == StageKind::Post)
             .filter_map(|s| Some((s.label.clone(), s.scene.take()?)))
@@ -387,7 +401,7 @@ impl NativePack {
             && !material.as_ref().is_some_and(traced);
         let computes = post.computes_trace();
         if (!scenes.is_empty() || computes) && !refused {
-            let shape = super::native_post::trace::TraceShape::of(terrain, entities);
+            let shape = super::native_post::trace::TraceShape::of(terrain, entities, lights);
             if !post.trace_scene(device, scenes, constants, &shape, &frame.pbr)
                 && let Some(m) = material.as_mut()
             {
@@ -448,6 +462,9 @@ impl NativePack {
         self.frame
             .block_light
             .update(queue, frame.camera, lights, light_revision);
+        if let Some(r) = &mut self.frame.ray_lights {
+            r.update(queue, frame.camera, lights, light_revision);
+        }
         let Some(t) = &mut self.timing else {
             return false;
         };

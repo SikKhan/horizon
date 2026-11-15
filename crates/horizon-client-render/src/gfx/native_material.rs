@@ -484,7 +484,7 @@ impl NativeMaterial {
         }
         let pipelines = built?;
         let scene = stage.scene_source.as_deref().and_then(|source| {
-            let terrain = (shape, stage.traces_entities());
+            let terrain = (shape, stage.traces_entities(), stage.traces_lights());
             TerrainTrace::new(device, frame, terrain, |group| build(source, group))
         });
         Ok(Self {

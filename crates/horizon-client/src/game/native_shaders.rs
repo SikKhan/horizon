@@ -258,8 +258,25 @@ impl Game<'_> {
                     }
                 }
             }
+            // Every light-giving block state, for a pack whose rays aim at light sources: its
+            // `[[lights]]` colour, white where it has none.
+            let mut sources = horizon_client::gfx::block_light::LightTable::default();
+            if horizon_shader_api::stages::names_ray_lights(&pack) {
+                for (id, state) in self.res.facts().states.iter().enumerate() {
+                    if state.emission > 0 {
+                        let color = pack.manifest.light_of(&state.name).unwrap_or([1.0; 3]);
+                        sources.insert(id as u32, (color, state.emission));
+                    }
+                }
+            }
             let labels = renderer
-                .set_native_shader_pack(Some((report, constants, tags, materials, lights)))
+                .set_native_shader_pack(Some((
+                    report,
+                    constants,
+                    tags,
+                    materials,
+                    (lights, sources),
+                )))
                 .map_err(|e| vec![e])?;
             Ok((pack.manifest, labels, translucent))
         });

@@ -237,7 +237,7 @@ linear light: decode a constant written for display values with a 2.2 power, com
 `frame.luminance`, and stop returning `input.color.a` from post passes (their alpha is ignored). The example pack,
 `crates/horizon-shader-api/packs/golden_hour`, was moved this way. `packs/traced_shadows` and
 `packs/traced_water` are the smallest packs that trace rays, from a post pass and from the material stage
-([the guide](../shaders.md#ray-tracing)).
+([the guide](../shaders.md#ray-tracing)); `packs/traced_lights` lights a post pass with the block light sources.
 
 ## Testing a pack frame by frame
 
@@ -271,6 +271,11 @@ no shadow into a pack's shadow map yet, and the first-person hand has no stage.
 
 ## Changelog
 
+- 2026-11-15: API 0.2 (additions, experimental): the light sources under `[ray_tracing]`. A pack whose files name
+  `ray_lights_near`, `ray_light`, `ray_light_at`, `ray_light_count` or `RayLight` gets the light-giving blocks around
+  the camera (`RayLight`: position, level, colour, block state; up to 1024, nearest first) and a grid of 8-block cells
+  listing the sources that reach each, so a pass aims shadow rays at a few sources
+  ([the guide](../shaders.md#light-sources)). Other packs are unchanged.
 - 2026-11-15: API 0.2 (experimental): `frame.light_direction` is the sun by day and the moon by night also for a pack
   without a `[shadow]` stage, where it now equals the frame's `sun_direction` or `moon_direction`; it read straight up
   (0, 1, 0) at every time of day until now, so a pack that traced its shadows along it got them straight down. Packs

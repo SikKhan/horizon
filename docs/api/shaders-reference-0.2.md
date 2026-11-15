@@ -315,7 +315,8 @@ pass reads a blank one in place of the target it writes).
 
 With `[ray_tracing]` in the manifest (it has no keys, and needs a `[[post]]` pass, a `[[before_world]]` pass or a
 `[material]` stage) the post stage's prelude also has `RayHit` and the functions and constants below, so do the
-material, compute and `[[before_world]]` stages' where their files name one of the four trace functions, and the
+material, compute and `[[before_world]]` stages' where their files name one of the four trace functions (or a
+light function, below), and the
 `Frame` of every stage of the pack has `has_ray_tracing` and `ray_distance`. A pack without the key has none of
 them, and a material, compute or `[[before_world]]` stage that names no trace function is built as without it.
 
@@ -349,6 +350,14 @@ asks for ray queries and keeps the scene with any pack or none; any other value 
   and `block_specular_map_level(uv, 0.0)` read a drawn surface's; their defaults without maps, and on a miss.
 - In the post, compute and `[[before_world]]` stages, `fn block_pbr_maps() -> bool`: whether the resource packs
   ship LabPBR maps, as the material stage's.
+- The light sources, only in a pack whose files name one of these five, outside a comment: `struct RayLight`
+  (`position`, the centre of its block, camera-relative; `level`, its light level 1 to 15; `color`, its `[[lights]]`
+  colour, white for a block the pack gives none; `state`, its block state), `fn ray_light_count() -> u32` and
+  `fn ray_light(i: u32) -> RayLight`: every block that gives off light within the grid, the nearest the camera first,
+  at most 1024; `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources that reach a camera-relative
+  point, as the first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads (the grid's cells are 8
+  blocks, 16 a side around the camera, each listing at most 24, the strongest there first; none outside it). The
+  list only says where sources are: trace towards one (`trace_any`) to know whether its light gets through.
 
 A ray starts at `origin` itself, so move a point off its own surface before tracing from it. What stops it is what
 the surface's own pass draws. In the solid layer it passes through the clear texels of a cut-out texture (leaves,
@@ -393,7 +402,8 @@ The nearest surface along a ray, from `trace` or `trace_layers`. Its `albedo`, `
 | `horizon_sprite` | `u32` | Horizon's own: where the hit's sprite is kept, for `hit_normal_map` and `hit_specular_map`. Not for packs to read; it changes with the renderer. |
 
 Bindings 48 to 59 of group 3 hold the scene while the game traces (60 to
-63 the entity layer, for a pack that names it), and in a post, compute or `[[before_world]]` pass bindings
+63 the entity layer, for a pack that names it, 80 the light sources, for a pack that
+names them), and in a post, compute or `[[before_world]]` pass bindings
 12 and 13 the LabPBR maps (the material stage has them there already). They are Horizon's, as their
 `horizon_` names say, and change with the renderer.
 

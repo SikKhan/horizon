@@ -847,6 +847,7 @@ fn a_traced_pack_s_own_hit_helper_is_refused_as_its_own_trace_is() {
         "trace_layers",
         "RAY_TRANSLUCENT",
         "RAY_ENTITY",
+        "ray_lights_near",
         "hit_normal_map",
         "block_pbr_maps",
     ];
@@ -1128,6 +1129,41 @@ fn the_entity_layer_is_the_pack_s_that_names_it() {
     assert!(problems[0].message.contains("entity"), "{problems:#?}");
     let named = format!("const LAYERS: u32 = RAY_ENTITY;\n{reads}");
     assert!(traced(&named).unwrap().stages[0].traces_entities());
+}
+
+/// A post pass that lights its point with the sources its cell lists, each tested with a ray.
+const LIT: &str = "fn post(input: PostInput) -> vec4<f32> {
+    let p = view_position(input.uv, input.depth);
+    let near = ray_lights_near(p);
+    var light = vec3<f32>(0.0);
+    for (var i = 0u; i < near.y; i++) {
+        let source = ray_light(ray_light_at(near.x + i));
+        let to = source.position - p;
+        if !trace_any(p, normalize(to), length(to)) {
+            light += source.color * source.level;
+        }
+    }
+    return vec4<f32>(input.color.rgb + light * f32(ray_light_count()), 1.0);
+}
+";
+
+/// The light sources are only a pack's whose files name a light function: its post pass is
+/// checked without the scene and with it (each translated to SPIR-V, HLSL and Metal) and binds
+/// their buffer against the scene; another traced pack's binds none.
+#[test]
+fn the_light_sources_are_the_pack_s_that_names_them() {
+    let report = traced(LIT).unwrap();
+    let post = &report.stages[0];
+    assert!(post.traces_lights());
+    let plain = naga::valid::Capabilities::default();
+    assert!(!ray_queries(&post.module) && valid(&post.module, plain));
+    let scene = post.scene.as_ref().unwrap();
+    assert!(valid(scene, plain | naga::valid::Capabilities::RAY_QUERY));
+    assert!(!traced(SHADOWED).unwrap().stages[0].traces_lights());
+    let commented = format!("// ray_lights_near\n{SHADOWED}");
+    assert!(!traced(&commented).unwrap().stages[0].traces_lights());
+    // Without `[ray_tracing]` there are no light functions.
+    assert!(post_pack(LIT, TONEMAP, "").is_err());
 }
 
 /// A traced pack whose files don't name `RAY_ENTITY` composes as it did before the entity layer,
