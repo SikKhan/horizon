@@ -148,7 +148,8 @@ gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>               
   - The prepared resources, and the oracle results with the parity state, sealed by `tools/ci/sealed-cache.sh`:
     tar, zstd, the dataset's own encryption (AES-256-CBC, PBKDF2), then HMAC-SHA256 over the ciphertext with a
     second key derived from the passphrase. Unsealing checks the tag before it decrypts. An entry that fails is
-    discarded with a warning, and the run goes on without it.
+    discarded with a warning, and the run goes on without it. The oracle shim's runtime memo
+    (`.local/parity-runner/runtime-memo`, guarded by one machine's file stat data) is never sealed or restored.
 - **What never leaves the runner** unsealed: the data, what is prepared from it, and `.local/` but the build. None
   of it goes into an artifact.
 - **What is public.** The job logs and the uploaded logs hold what `parity.yml`'s public runs already show: compared

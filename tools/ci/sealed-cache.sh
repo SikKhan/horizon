@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Game-derived folders sealed for a cache entry, and unsealed from one (.github/workflows/parity-hosted.yml).
 #
-#   VANILLA_DATA_PASSPHRASE=... bash tools/ci/sealed-cache.sh seal LABEL ARCHIVE FOLDER...
-#   VANILLA_DATA_PASSPHRASE=... bash tools/ci/sealed-cache.sh unseal LABEL ARCHIVE STAGE
+#   VANILLA_DATA_PASSPHRASE=... bash tools/ci/sealed-cache.sh seal LABEL ARCHIVE [--exclude PATH]... FOLDER...
+#   VANILLA_DATA_PASSPHRASE=... bash tools/ci/sealed-cache.sh unseal LABEL ARCHIVE [--exclude PATH]... STAGE
 #
 # A fork's pull request can restore the default branch's cache entries, and a branch's own copy of a workflow can
 # name any key, so what is made from the vanilla data goes into a cache only as this archive:
@@ -17,7 +17,9 @@
 # from /), which the workflow copies into place. Whatever fails there (no tag, a wrong tag, a broken archive, a path
 # outside the two folders below) is a warning: STAGE is removed and the run goes on cold, never fails for it.
 #
-# FOLDERs are absolute paths under the checkout or RUNNER_TEMP. The passphrase comes from this step's environment, is
+# FOLDERs are absolute paths under the checkout or RUNNER_TEMP. An excluded PATH (a file or folder in them, such as
+# the oracle shim's machine-local runtime memo) is never sealed, and unseal removes it from the stage should an
+# entry hold it. The passphrase comes from this step's environment, is
 # written to a private temporary file and unset at once, and that file goes before the script ends, whatever happens.
 # The MAC key never reaches a command line: the runner's own Python derives it from the file. Only sizes, counts and
 # seconds are printed, never a file name or the secret.
@@ -27,11 +29,17 @@ mode=${1:?seal or unseal}
 label=${2:?label}
 archive=${3:?archive}
 shift 3
+excluded=()
+while [ "${1-}" = --exclude ]; do
+  excluded+=("$(realpath -m "${2:?--exclude needs a path}")")
+  shift 2
+done
 [[ "$label" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::bad label"; exit 2; }
 : "${VANILLA_DATA_PASSPHRASE:?}" "${GITHUB_WORKSPACE:?}" "${RUNNER_TEMP:?}"
 workspace=$(realpath -m "$GITHUB_WORKSPACE")
 temp=$(realpath -m "$RUNNER_TEMP")
 allowed() { case "$1/" in "$workspace"/?*|"$temp"/?*) return 0 ;; *) return 1 ;; esac; }
+for path in "${excluded[@]}"; do allowed "$path" || { echo "::error::an excluded path must be under the checkout or RUNNER_TEMP"; exit 2; }; done
 
 work=$(mktemp -d "$temp/sealed-cache.XXXXXX")
 cleanup() { rm -rf "$work"; }
@@ -73,7 +81,11 @@ case "$mode" in
     done
     [ "${#members[@]}" -gt 0 ] || { echo "nothing to seal"; exit 0; }
     mkdir -p "$(dirname "$archive")"
-    tar -C / --format=posix --pax-option=delete=atime,delete=ctime -cf - -- "${members[@]}" |
+    # Member names are relative to / and anchored: an excluded folder is left out with everything under it.
+    patterns=()
+    for path in "${excluded[@]}"; do patterns+=("--exclude=${path#/}"); done
+    tar -C / --format=posix --pax-option=delete=atime,delete=ctime --anchored "${patterns[@]}" \
+      -cf - -- "${members[@]}" |
       zstd -q -T0 -3 |
       openssl enc -e "${cipher[@]}" > "$work/archive"
     mac "$work/archive" > "$work/archive.mac"
@@ -97,6 +109,12 @@ case "$mode" in
     outside=0
     while IFS= read -r member; do allowed "/${member%/}" || outside=$((outside + 1)); done < "$work/members"
     [ "$outside" -eq 0 ] || discard "$outside paths outside the checkout and RUNNER_TEMP"
+    for path in "${excluded[@]}"; do
+      if [ -e "$stage$path" ] || [ -L "$stage$path" ]; then
+        rm -rf "${stage:?}$path"
+        echo "::warning::the $label cache entry held an excluded path: removed before it is placed"
+      fi
+    done
     echo "unsealed $label: $(( $(stat -c %s "$archive") / 1024 )) KiB in $((SECONDS - started)) s"
     ;;
   *) echo "::error::seal or unseal"; exit 2 ;;

@@ -209,6 +209,16 @@ class HostedParityTests(unittest.TestCase):
         self.assertEqual(re.findall(r"ref=\S+", script), ['ref=$TRUSTED_REF"'] * 2)
         self.assertEqual(self.step("The fetch and seal scripts, from the default branch")["env"]["TRUSTED_REF"],
                          "${{ github.event.repository.default_branch }}")
+        # The oracle shim's runtime memo (machine-local stat data) is excluded wherever the oracle entry is sealed or
+        # unsealed; tests/test_ci_sealed_cache.py checks the exclusion itself.
+        self.assertIn('echo "RUNTIME_MEMO=$GITHUB_WORKSPACE/.local/parity-runner/runtime-memo"',
+                      self.step("Folders for the data, outside the checkout")["run"])
+        for name, mode in (("Unseal the restored caches", "unseal"), ("Seal for the caches", "seal")):
+            calls = re.findall(rf'sealed-cache\.sh" {mode} \\\n\s+(.*)', self.step(name)["run"])
+            oracle = [call for call in calls if "oracle" in call or "$label" in call]
+            self.assertTrue(oracle, name)
+            for call in oracle:
+                self.assertIn('--exclude "$RUNTIME_MEMO"', call, name)
         # What the plan job (the tested tree) gives the keys is checked before it names anything.
         self.assertIn("the plan's keys are not what it computes", self.step("Cache keys")["run"])
 

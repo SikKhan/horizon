@@ -88,6 +88,30 @@ class SealedCacheTests(unittest.TestCase):
         self.assertFalse(stage.exists())
         self.assertIn("no oracle cache entry", out)
 
+    def test_an_excluded_folder_is_never_sealed_nor_placed(self):
+        # The oracle shim's runtime memo: JDK file hashes guarded by stat data of one machine (tools/parity_shim.py).
+        memo = self.folder / "runtime-memo"
+        (memo / "jdk").mkdir(parents=True)
+        (memo / "jdk/hashes.json").write_bytes(b"{}")
+        result = self.run_script("seal", "oracle", self.archive, "--exclude", memo, self.folder)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        stage, _ = self.unseal()
+        self.assertTrue((stage / str(self.file).lstrip("/")).exists())
+        self.assertFalse((stage / str(memo).lstrip("/")).exists())
+        self.assertTrue(memo.exists())
+
+    def test_an_entry_holding_an_excluded_path_has_it_removed_on_unsealing(self):
+        memo = self.folder / "runtime-memo"
+        memo.mkdir()
+        (memo / "x.json").write_bytes(b"{}")
+        self.seal()
+        stage = self.temp / "stage"
+        result = self.run_script("unseal", "oracle", self.archive, "--exclude", memo, stage)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((stage / str(self.file).lstrip("/")).exists())
+        self.assertFalse((stage / str(memo).lstrip("/")).exists())
+        self.assertIn("held an excluded path", result.stdout)
+
     def test_only_folders_under_the_checkout_or_runner_temp_are_sealed(self):
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside)
