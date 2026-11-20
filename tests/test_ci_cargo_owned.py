@@ -51,7 +51,8 @@ class CargoOwnedTests(unittest.TestCase):
         self.assertEqual(self.main("check"), 0, self.out)
 
     def test_anything_else_is_refused(self):
-        for relative in ("release/world.json", "release/saves/level.dat", "oracle.txt",
+        # world_probe.d exists: a same-stem file that is no artifact is still refused.
+        for relative in ("release/world.json", "release/world_probe.json", "release/saves/level.dat", "oracle.txt",
                          "x86_64-unknown-linux-gnu/release/deps/liba.rlib"):
             with self.subTest(relative):
                 self.state.unlink()

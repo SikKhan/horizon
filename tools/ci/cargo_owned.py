@@ -17,6 +17,8 @@ from pathlib import Path
 
 CARGO_FOLDERS = {"deps", "build", ".fingerprint", "incremental", "examples"}
 TOP_FILES = {".rustc_info.json", "CACHEDIR.TAG", "source-mtimes-v1.json"}
+# What Cargo copies up into a profile folder: executables (no extension) and libraries.
+ARTIFACT_EXTENSIONS = {"", "rlib", "rmeta", "so", "a", "dylib", "dll", "exe", "pdb", "lib", "wasm"}
 
 
 def files(folders):
@@ -42,8 +44,11 @@ def cargos(relative, folder):
     if len(parts) > 2:
         return parts[1] in CARGO_FOLDERS
     name = parts[1]
-    return (name.endswith(".d") or name.startswith(".cargo-")
-            or (folder / parts[0] / f"{name.split('.', 1)[0]}.d").exists())
+    if name.endswith(".d") or name.startswith(".cargo-"):
+        return True
+    # An artifact Cargo copied up: a binary or library kind, beside its own dep-info file.
+    stem, _, extension = name.partition(".")
+    return extension in ARTIFACT_EXTENSIONS and (folder / parts[0] / f"{stem}.d").exists()
 
 
 def main(argv):

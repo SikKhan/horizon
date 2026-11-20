@@ -6,7 +6,10 @@
 - Neither takes a job that holds a secret or whose token can push, publish or start workflows: playhorizon is a
   partner's server, and a checks runner keeps what a fork's job left behind.
 """
+import os
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -209,18 +212,33 @@ class HostedParityTests(unittest.TestCase):
         self.assertEqual(re.findall(r"ref=\S+", script), ['ref=$TRUSTED_REF"'] * 2)
         self.assertEqual(self.step("The fetch and seal scripts, from the default branch")["env"]["TRUSTED_REF"],
                          "${{ github.event.repository.default_branch }}")
-        # The oracle shim's runtime memo (machine-local stat data) is excluded wherever the oracle entry is sealed or
-        # unsealed; tests/test_ci_sealed_cache.py checks the exclusion itself.
-        self.assertIn('echo "RUNTIME_MEMO=$GITHUB_WORKSPACE/.local/parity-runner/runtime-memo"',
-                      self.step("Folders for the data, outside the checkout")["run"])
+        # The oracle shim's runtime memo (machine-local stat data) and this run's logs are excluded wherever the
+        # oracle entry is sealed or unsealed; tests/test_ci_sealed_cache.py checks the exclusion itself.
+        folders = self.step("Folders for the data, outside the checkout")["run"]
+        self.assertIn('echo "RUNTIME_MEMO=$GITHUB_WORKSPACE/.local/parity-runner/runtime-memo"', folders)
+        self.assertIn('echo "PARITY_LOGS=$GITHUB_WORKSPACE/.local/parity-runner/logs"', folders)
         for name, mode in (("Unseal the restored caches", "unseal"), ("Seal for the caches", "seal")):
             calls = re.findall(rf'sealed-cache\.sh" {mode} \\\n\s+(.*)', self.step(name)["run"])
             oracle = [call for call in calls if "oracle" in call or "$label" in call]
             self.assertTrue(oracle, name)
             for call in oracle:
-                self.assertIn('--exclude "$RUNTIME_MEMO"', call, name)
-        # What the plan job (the tested tree) gives the keys is checked before it names anything.
-        self.assertIn("the plan's keys are not what it computes", self.step("Cache keys")["run"])
+                self.assertIn('--exclude "$RUNTIME_MEMO" --exclude "$PARITY_LOGS"', call, name)
+
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    def test_the_plans_key_values_are_checked_before_they_name_anything(self):
+        # They come from the tested tree (the plan job): the step's own check, run with good and bad values.
+        script = self.step("Cache keys")["run"].split("\nh() {", 1)[0]
+        good = {"GROUP": "game+client", "JAVA_MAJOR": "25", "LOCK": "0123456789ab", "PREPARE": "0123456789abcdef"}
+        bad = [("GROUP", "game/../x"), ("GROUP", ""), ("JAVA_MAJOR", "25 x"), ("LOCK", "0123456789aB"),
+               ("PREPARE", "0123456789abcdef0"), ("PREPARE", "../../etc")]
+        # The resolved path: on Windows, a bare "bash" is System32's WSL launcher, which drops the environment.
+        bash = shutil.which("bash")
+        def run(values):
+            return subprocess.run([bash, "-c", script], env={**os.environ, **values}, capture_output=True).returncode
+        self.assertEqual(run(good), 0)
+        for name, value in bad:
+            with self.subTest(name=name, value=value):
+                self.assertNotEqual(run({**good, name: value}), 0)
 
     def test_only_mains_runs_save(self):
         self.assertIn(self.SAVE_CACHES, self.text)

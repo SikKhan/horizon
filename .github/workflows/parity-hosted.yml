@@ -186,6 +186,9 @@ jobs:
             # The oracle shim's memo of JDK file hashes, guarded by this machine's stat data (tools/parity_shim.py):
             # never sealed, restored or placed.
             echo "RUNTIME_MEMO=$GITHUB_WORKSPACE/.local/parity-runner/runtime-memo"
+            # This run's harness logs: one restored from an earlier run would read as this run's (a first-run log as
+            # an unfinished retry).
+            echo "PARITY_LOGS=$GITHUB_WORKSPACE/.local/parity-runner/logs"
           } >> "$GITHUB_ENV"
       # The data is fetched and the caches unsealed before the tested commit is checked out or any of its code runs,
       # by the default branch's copies of the scripts: the secrets never meet the tested code. Without the fetch
@@ -280,7 +283,7 @@ jobs:
           set -euo pipefail
           for label in prepared oracle; do
             VANILLA_DATA_PASSPHRASE="$VANILLA_DATA_PASSPHRASE" bash "$RUNNER_TEMP/trusted/sealed-cache.sh" unseal \
-              "$label" "$SEALED/$label/archive" --exclude "$RUNTIME_MEMO" "$UNSEALED/$label"
+              "$label" "$SEALED/$label/archive" --exclude "$RUNTIME_MEMO" --exclude "$PARITY_LOGS" "$UNSEALED/$label"
             rm -rf "${SEALED:?}/$label"
           done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -454,7 +457,8 @@ jobs:
           if [ "$SEAL_ORACLE" = true ]; then
             mapfile -t folders < <(find .local -mindepth 1 -maxdepth 1 -type d ! -name parity-target -printf "$PWD/%p\n")
             VANILLA_DATA_PASSPHRASE="$VANILLA_DATA_PASSPHRASE" bash "$RUNNER_TEMP/trusted/sealed-cache.sh" seal \
-              oracle "$SEALED/oracle/archive" --exclude "$RUNTIME_MEMO" "${folders[@]}" "$PARITY_SHARED"
+              oracle "$SEALED/oracle/archive" --exclude "$RUNTIME_MEMO" --exclude "$PARITY_LOGS" \
+              "${folders[@]}" "$PARITY_SHARED"
             echo "oracle=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Save the prepared resources (sealed)
