@@ -890,6 +890,17 @@ class OracleReuseTests(unittest.TestCase):
         self.assertEqual(self.oracle(HORIZON_PHASE="terrain", HORIZON_ORDER=str(order), SOMETHING_NEW="1"), 4)
         self.assertEqual(self.reasons(), ["environment", "environment", "environment", "hit"])
 
+    def test_a_call_on_another_hosted_runner_replays(self):
+        # Blacksmith sets these per VM (its name and id, its Turborepo cache's address and token): two runners'
+        # calls that differ only in them are the same call.
+        first = dict(PETNAME="calm-otter", VM_ID="vm-1", TURBO_API="http://10.0.0.1:1", TURBO_TOKEN="a")
+        second = dict(PETNAME="brisk-heron", VM_ID="vm-2", TURBO_API="http://10.0.0.2:2", TURBO_TOKEN="b")
+        self.assertEqual(self.oracle(**first), 1)
+        self.assertEqual(self.oracle(**second), 1)
+        # Only those names: a variable that merely starts like one is still in the key.
+        self.assertEqual(self.oracle(**second, TURBO_TEAM="x"), 2)
+        self.assertEqual(self.reasons(), ["no-record", "hit", "environment"])
+
     def test_a_datapack_folder_is_keyed_through_its_linked_folders(self):
         root = self.input.parent.parent
         packs, elsewhere = root / "datapacks", root / "elsewhere" / "pack"
