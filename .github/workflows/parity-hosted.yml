@@ -191,7 +191,7 @@ jobs:
         id: trusted
         env:
           GH_TOKEN: ${{ github.token }}
-          TRUSTED_REF: ci/hosted-parity-caches  # PROOF ONLY, reverted before review
+          TRUSTED_REF: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/trusted"
