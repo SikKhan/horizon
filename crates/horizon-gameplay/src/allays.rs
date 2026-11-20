@@ -1,5 +1,6 @@
 //! Allays on the server side: spotting and picking up matching drops, and
 //! throwing their load to the liked player or note block (`AllayAi`).
+// Proof only (ci/hosted-parity-caches): a one-line change, as a pull request touching this crate makes.
 use crate::mob_level::MobLevel;
 use horizon_client::{
     items::ItemStack,

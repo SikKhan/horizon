@@ -23,7 +23,7 @@ env:
   # Only a run of main writes the caches every other run starts from (docs/ci-runners.md#hosted-parity). Today the
   # only such run is a dispatch on main; the allow-list keeps an event that reports main's ref for another's code (a
   # pull_request_target) out if a trigger is added.
-  SAVE_CACHES: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/hosted-parity-caches') && contains(fromJSON('["workflow_dispatch", "push", "schedule"]'), github.event_name) && 'true' || 'false' }}
+  SAVE_CACHES: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["workflow_dispatch", "push", "schedule"]'), github.event_name) && 'true' || 'false' }}
 
 jobs:
   # Which harnesses, on how many runners: no secret and no game data here.
