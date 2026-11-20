@@ -94,6 +94,45 @@ mod tests {
     use mod_api::{Text as ApiText, TextFormError};
     use serde_json::json;
 
+    /// Driven by tools/test_native_text_nbt_parity.py against the pinned vanilla codec.
+    #[test]
+    #[ignore = "vanilla parity harness"]
+    fn vanilla_nbt_oracle() {
+        let cases =
+            std::fs::read_to_string(std::env::var("HORIZON_TEXT_NBT_CASES").unwrap()).unwrap();
+        let expected =
+            std::fs::read_to_string(std::env::var("HORIZON_TEXT_NBT_ORACLE").unwrap()).unwrap();
+        let cases: Vec<_> = cases.lines().collect();
+        let expected: Vec<_> = expected.lines().collect();
+        assert_eq!(cases.len(), expected.len());
+        for (source, expected) in cases.into_iter().zip(expected) {
+            let (tag, used) = horizon_core::nbt::parse_snbt(source).unwrap();
+            assert_eq!(used, source.len());
+            let text = read_text_nbt(&tag, &Registries::default()).unwrap();
+            fn pages(text: &ApiText, out: &mut Vec<i32>) {
+                if let Some(TextClick::ChangePage(page)) = &text.style.click {
+                    out.push(*page);
+                }
+                if let Some(TextHover::Text(hover)) = &text.style.hover {
+                    pages(hover, out);
+                }
+                for child in &text.children {
+                    pages(child, out);
+                }
+            }
+            let actual = match text {
+                None => "reject".to_owned(),
+                Some(text) => {
+                    let mut found = Vec::new();
+                    pages(&text, &mut found);
+                    let found = format!("{found:?}").replace(' ', "");
+                    format!("ok {found}")
+                }
+            };
+            assert_eq!(actual, expected, "{source}");
+        }
+    }
+
     /// A plain unstyled literal is its string, a styled one stays a compound: both forms of the same
     /// plain name are one component.
     #[test]
