@@ -395,12 +395,18 @@ asks for ray queries and keeps the scene with any pack or none; any other value 
   vanilla's light level of the block, 1 to 15 (a terrain hit's `RayHit.emission` times 15); `color: vec3<f32>`,
   its `[[lights]]` colour decoded to linear as `block_light_color`'s is, white for a block the pack gives none;
   `material: u32`, its `[[materials]]` id, the one `RayHit.material` reports on the first face of its model whose
-  sprite has one, 0 where none does. `fn ray_light_count() -> u32` and `fn ray_light(i: u32) -> RayLight`: the
-  blocks that give off light in the grid or within 15 blocks of it, the nearest the camera first, at most 1024.
+  sprite has one, 0 where none does; it is taken from one fixed model of the block state, so where a resource pack
+  gives the state weighted models with different materials it can differ from the `RayHit.material` of that
+  block. `fn ray_light_count() -> u32` and `fn ray_light(i: u32) -> RayLight`: the blocks that give off light
+  in the sections the grid or 15 blocks around it touch (so up to a section past where their light reaches it),
+  the nearest the camera first, at most 1024; `ray_light` gives level 0 past the count.
   Fluids are left out: lava is not listed, so lava lakes don't light through `ray_lights_near` (they would fill
   every cell nearby and push the torches out; a ray meets the lava's surface anyway, with its `emission`).
-  `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources that reach a camera-relative point, as the
-  first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads; none outside the grid. The list is
+  `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources whose light reaches some part of the cell of
+  a camera-relative point, as the first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads;
+  none outside the grid. `ray_light_at` gives `0xffffffffu`, which `ray_light` reads as level 0, for an `i` past
+  its cell's count. Both are candidate sets, not a verdict: a source listed may not reach the point itself, so
+  the pack's own falloff (and a trace) decides what each gives. The list is
   the data, and the grid a convenience built from it with fixed choices (8-block cells, 16 a side around the
   camera, at most 24 a cell, ranked by vanilla's falloff, level minus distance, at the cell's nearest point): a
   pack that wants others reads the list and builds its own grid into a kept buffer in a compute or

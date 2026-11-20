@@ -4,9 +4,10 @@
 //! A pass shades a point with the few sources its cell lists, each tested with a shadow ray,
 //! instead of every source in the world.
 //!
-//! The buffer is rebuilt on the CPU when the camera moves on to another 16-block step or the
-//! light sources change, from the sources the section meshes list (`SectionMesh::lights`); its
-//! corner, relative to the player's camera (`frame.camera_position`), is written every frame.
+//! The buffer is rebuilt on a worker thread when the camera moves on to another 16-block step or
+//! the light sources change, from the sources the section meshes list (`SectionMesh::lights`),
+//! and uploaded once built; its corner, relative to the player's camera
+//! (`frame.camera_position`), is written every frame.
 
 use crate::fast_hash::FxHashMap;
 use glam::{DVec3, IVec3, Vec3};
@@ -14,10 +15,11 @@ use horizon_shader_api::stages::{
     RAY_LIGHT_CELL, RAY_LIGHT_GRID, RAY_LIGHT_HEADER, RAY_LIGHT_MAX, RAY_LIGHT_PER_CELL,
     RAY_LIGHT_WORDS,
 };
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use super::SectionKey;
+use super::block_light::SectionLights;
 use horizon_items::blocks::Fluid;
 
 /// The grid moves in steps of this many blocks.
@@ -72,34 +74,37 @@ fn material_of(layers: impl IntoIterator<Item = u32>, materials: &[(u32, u32)]) 
 
 pub struct RayLights {
     pub buffer: wgpu::Buffer,
-    /// The world corner and the sources' revision last asked for, and when.
+    /// The world corner and the sources' revision of the last rebuild sent, and when.
     built: Option<([i32; 3], u64, Instant)>,
-    /// A rebuild is asked for and waits for the worker to be free: the latest state is sent
-    /// then, so the latest request wins.
-    wanted: bool,
     /// The corner of the words the buffer holds, which positions are written against.
     shown: Option<[i32; 3]>,
-    /// The worker, whether it runs a rebuild, and the buffers of the last one, for the next.
+    /// The worker (`start`), whether it runs a rebuild, and the buffers of the last one, for
+    /// the next.
     worker: Option<Worker>,
     running: bool,
     spare: Job,
-    /// Builds on this thread where the worker couldn't start.
+    /// Counts the worlds: a rebuild for an earlier one is dropped when it comes back.
+    epoch: u64,
+    /// The world changed: the next frame empties the buffer's list and grid.
+    blank: bool,
+    /// Builds on this thread where the worker couldn't start or is gone.
     table: Sources,
     builder: Builder,
 }
 
-/// A rebuild for the worker: the grid's corner, the camera, the light-giving blocks of the
-/// sections in its reach (`gather`), and the words to build into.
+/// A rebuild for the worker: the world it is for, the grid's corner, the camera, the
+/// light-giving blocks of the sections in its reach (`gather`), and the words to build into.
 #[derive(Default)]
 struct Job {
+    epoch: u64,
     origin: [i32; 3],
     camera: DVec3,
-    blocks: Vec<([i32; 3], u32)>,
+    blocks: Vec<Arc<[([i32; 3], u32)]>>,
     words: Vec<u32>,
 }
 
 /// The thread that builds the words (`Builder`), so a rebuild costs the render thread only the
-/// gathering and the upload.
+/// gathering of the sections' lists (one shared handle each, whatever they hold) and the upload.
 struct Worker {
     jobs: Sender<Job>,
     done: Receiver<Job>,
@@ -115,6 +120,8 @@ impl Worker {
                 let mut builder = Builder::default();
                 while let Ok(mut job) = job_rx.recv() {
                     builder.build(&table, &mut job);
+                    // A section's list replaced since is freed here, not on the render thread.
+                    job.blocks.clear();
                     if done_tx.send(job).is_err() {
                         break;
                     }
@@ -126,7 +133,9 @@ impl Worker {
 }
 
 impl RayLights {
-    pub fn new(device: &wgpu::Device, table: Sources) -> Self {
+    /// The buffer alone, for the passes' bind groups: `start` gives it its sources once a pass
+    /// that reads them is made.
+    pub fn new(device: &wgpu::Device) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Native shader pack ray light sources"),
             size: u64::from(WORDS) * 4,
@@ -136,41 +145,63 @@ impl RayLights {
         Self {
             buffer,
             built: None,
-            wanted: false,
             shown: None,
-            worker: Worker::spawn(table.clone()),
+            worker: None,
             running: false,
             spare: Job::default(),
-            table,
+            epoch: 0,
+            blank: false,
+            table: Sources::default(),
             builder: Builder::default(),
         }
+    }
+
+    /// The light-giving block states, and the worker that builds from them.
+    pub fn start(&mut self, table: Sources) {
+        self.worker = Worker::spawn(table.clone());
+        self.table = table;
+    }
+
+    /// Every section is gone (a new world, a new dimension): the buffer is emptied next frame,
+    /// and a rebuild still running for the old one is dropped.
+    pub fn clear(&mut self) {
+        self.epoch += 1;
+        (self.built, self.shown, self.blank) = (None, None, true);
     }
 
     /// Places the grid around `camera`. The sources and the cells are rebuilt, on the worker,
     /// when it moved on to another step, or when `revision` (of `sections`' sources) changed, at
     /// most every `SOURCE_REBUILDS` for that (a redstone clock would otherwise rebuild every
-    /// frame); a frame uploads them once they are built, a frame or two later.
+    /// frame); a frame uploads them once they are built, a frame or two later. `min_y` is the
+    /// lowest block of the level's columns, which the sections' keys count from.
     pub fn update(
         &mut self,
         queue: &wgpu::Queue,
         camera: DVec3,
-        sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
+        (sections, min_y): (&SectionLights, i32),
         revision: u64,
     ) {
-        if let Some(job) = self.worker.as_ref().and_then(|w| w.done.try_recv().ok()) {
-            self.running = false;
-            self.upload(queue, job);
+        match self.worker.as_ref().map(|w| w.done.try_recv()) {
+            Some(Ok(job)) => self.landed(queue, job),
+            // The worker is gone: its rebuild never lands, and this thread builds from now on.
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.worker = None;
+                if std::mem::take(&mut self.running) {
+                    self.built = None;
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        if std::mem::take(&mut self.blank) {
+            // No sources and no grid (`ray_lights_near` lists nothing) until the new world's.
+            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[0u32; 2]));
         }
         let (origin, now) = (grid_origin(camera), Instant::now());
-        if due(self.built, origin, revision, now) {
+        if !self.running && due(self.built, origin, revision, now) {
             self.built = Some((origin, revision, now));
-            self.wanted = true;
-        }
-        if self.wanted && !self.running {
-            self.wanted = false;
             let mut job = std::mem::take(&mut self.spare);
-            (job.origin, job.camera) = (origin, camera);
-            gather(origin, sections, &mut job.blocks);
+            (job.epoch, job.origin, job.camera) = (self.epoch, origin, camera);
+            gather(origin, min_y, sections, &mut job.blocks);
             match &self.worker {
                 Some(w) => match w.jobs.send(job) {
                     Ok(()) => self.running = true,
@@ -191,8 +222,18 @@ impl RayLights {
         }
     }
 
+    /// The worker's rebuild came back: uploaded, unless it is for an earlier world.
+    fn landed(&mut self, queue: &wgpu::Queue, job: Job) {
+        self.running = false;
+        match job.epoch == self.epoch {
+            true => self.upload(queue, job),
+            false => self.spare = job,
+        }
+    }
+
     fn build_here(&mut self, queue: &wgpu::Queue, mut job: Job) {
         self.builder.build(&self.table, &mut job);
+        job.blocks.clear();
         self.upload(queue, job);
     }
 
@@ -216,13 +257,12 @@ impl RayLights {
             .filter(|_| self.running)
             .and_then(|w| w.done.recv().ok())
         {
-            self.running = false;
-            self.upload(queue, job);
+            self.landed(queue, job);
         }
     }
 }
 
-/// Whether to rebuild the grid last `built` (its corner, revision and when) for the corner
+/// Whether to rebuild the grid last sent (`built`: its corner, revision and when) for the corner
 /// `origin` and the sources' `revision` at `now`: at once for a new corner, at most every
 /// `SOURCE_REBUILDS` for new sources alone.
 fn due(
@@ -248,24 +288,26 @@ fn grid_origin(camera: DVec3) -> [i32; 3] {
         .map(|v| v * STEP)
 }
 
-/// The light-giving blocks of the sections that the grid at `origin`, or light reaching into
-/// it (15 blocks), touches, into `blocks`: only the sections in that range are looked up, not
-/// the whole map, which may hold the render distance.
+/// The light-giving block lists of the sections that the grid at `origin`, or light reaching
+/// into it (15 blocks), touches, into `blocks`: only the sections in that range are looked up,
+/// not the whole map, which may hold the render distance, and each list is shared, not copied
+/// (a lava sea's lists are long). The sections' keys count from `min_y`.
 fn gather(
     origin: [i32; 3],
-    sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
-    blocks: &mut Vec<([i32; 3], u32)>,
+    min_y: i32,
+    sections: &SectionLights,
+    blocks: &mut Vec<Arc<[([i32; 3], u32)]>>,
 ) {
     let span = RAY_LIGHT_GRID as i32 * RAY_LIGHT_CELL as i32;
     let lo = origin.map(|v| (v - 15).div_euclid(16));
     let hi = origin.map(|v| (v + span + 15).div_euclid(16));
-    let below = crate::chunk::MIN_Y.div_euclid(16);
+    let below = min_y.div_euclid(16);
     blocks.clear();
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 if let Some(lights) = sections.get(&(x, y - below, z)) {
-                    blocks.extend_from_slice(lights);
+                    blocks.push(lights.clone());
                 }
             }
         }
@@ -294,12 +336,12 @@ fn nearest_first(a: &Found, b: &Found) -> std::cmp::Ordering {
 fn find(
     table: &Sources,
     (origin, camera): ([i32; 3], DVec3),
-    blocks: &[([i32; 3], u32)],
+    blocks: &[Arc<[([i32; 3], u32)]>],
     found: &mut Vec<Found>,
 ) {
     let corner = IVec3::from(origin).as_dvec3();
     found.clear();
-    for &(block, state) in blocks {
+    for &(block, state) in blocks.iter().flat_map(|lights| lights.iter()) {
         let Some(source) = table.get(&state) else {
             continue;
         };
@@ -437,14 +479,14 @@ fn build(
     table: &Sources,
     origin: [i32; 3],
     camera: DVec3,
-    sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
+    (sections, min_y): (&SectionLights, i32),
 ) -> Vec<u32> {
     let mut job = Job {
         origin,
         camera,
         ..Job::default()
     };
-    gather(origin, sections, &mut job.blocks);
+    gather(origin, min_y, sections, &mut job.blocks);
     Builder::default().build(table, &mut job);
     job.words
 }
@@ -461,15 +503,23 @@ mod tests {
         }
     }
 
-    /// `(state, block)` sources keyed by their sections, as the meshes list them.
-    fn sections(blocks: &[([i32; 3], u32)]) -> FxHashMap<SectionKey, Vec<([i32; 3], u32)>> {
-        let mut sections: FxHashMap<SectionKey, Vec<_>> = FxHashMap::default();
+    /// `(state, block)` sources keyed by their sections, as the meshes list them, in columns
+    /// from `min_y`.
+    fn sections_from(blocks: &[([i32; 3], u32)], min_y: i32) -> SectionLights {
+        let mut sections: FxHashMap<crate::gfx::SectionKey, Vec<_>> = FxHashMap::default();
         for &(p, state) in blocks {
-            let key = (p[0] >> 4, (p[1] - crate::chunk::MIN_Y) >> 4, p[2] >> 4);
+            let key = (p[0] >> 4, (p[1] - min_y) >> 4, p[2] >> 4);
             sections.entry(key).or_default().push((p, state));
         }
-        sections
+        sections.into_iter().map(|(k, v)| (k, v.into())).collect()
     }
+
+    /// `sections_from` in vanilla's columns.
+    fn sections(blocks: &[([i32; 3], u32)]) -> SectionLights {
+        sections_from(blocks, crate::chunk::MIN_Y)
+    }
+
+    const MIN_Y: i32 = crate::chunk::MIN_Y;
 
     /// A torch at the camera and a dim source in its cell: both are listed nearest first, with
     /// their colour, level and material, a cell the torch's light still reaches lists only the
@@ -483,7 +533,7 @@ mod tests {
         let camera = DVec3::new(8.5, 64.5, 8.5);
         let origin = grid_origin(camera);
         assert_eq!(origin, [-64, 0, -64]);
-        let words = build(&table, origin, camera, &sections);
+        let words = build(&table, origin, camera, (&sections, MIN_Y));
         let float = |i: usize| f32::from_bits(words[i]);
         // State 1 gives no light: two sources, the torch first.
         assert_eq!(words[0], 2);
@@ -537,7 +587,7 @@ mod tests {
         table: &Sources,
         origin: [i32; 3],
         camera: DVec3,
-        sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
+        sections: &SectionLights,
     ) -> Vec<u32> {
         let n = RAY_LIGHT_GRID as usize;
         let mut words = vec![0u32; WORDS as usize];
@@ -555,7 +605,7 @@ mod tests {
             if (0..3).any(|i| key[i] < lo[i] || key[i] > hi[i]) {
                 continue;
             }
-            for &(block, state) in lights {
+            for &(block, state) in lights.iter() {
                 let Some(source) = table.get(&state) else {
                     continue;
                 };
@@ -653,11 +703,11 @@ mod tests {
             let camera = IVec3::from(camera).as_dvec3() + 0.3;
             let origin = grid_origin(camera);
             let want = reference(&table, origin, camera, &sections);
-            assert_eq!(build(&table, origin, camera, &sections), want);
+            assert_eq!(build(&table, origin, camera, (&sections, MIN_Y)), want);
             let full = (0..CELLS as usize).filter(|&c| want[COUNTS as usize + c] == 24);
             assert!(seed == 2 || full.count() > 0, "no cell overflows");
             (job.origin, job.camera) = (origin, camera);
-            gather(origin, &sections, &mut job.blocks);
+            gather(origin, MIN_Y, &sections, &mut job.blocks);
             builder.build(&table, &mut job);
             let got = &job.words;
             assert_eq!(
@@ -697,20 +747,87 @@ mod tests {
         let mut table = Sources::default();
         table.insert(1, lit([1.0; 3], 15, 1));
         let sections = sections(&[([2, 64, 0], 1)]);
-        let mut lights = RayLights::new(&device, table);
+        let mut lights = RayLights::new(&device);
+        lights.start(table);
         assert!(lights.worker.is_some());
         let camera = DVec3::new(0.5, 64.5, 0.5);
-        lights.update(&queue, camera, &sections, 1);
+        lights.update(&queue, camera, (&sections, MIN_Y), 1);
         assert!(lights.running && lights.shown.is_none());
         lights.settle(&queue);
         assert_eq!(lights.shown, Some(grid_origin(camera)));
         assert_eq!(lights.spare.words[0], 1);
+        assert!(lights.spare.blocks.is_empty());
+    }
+
+    /// A new world drops the old one's rebuild still on the worker and empties the buffer; its
+    /// first frame rebuilds.
+    #[test]
+    fn a_rebuild_for_the_world_before_is_dropped() {
+        let Some((_, device, queue)) = crate::gfx::test_gpu::optional_device() else {
+            return;
+        };
+        let mut table = Sources::default();
+        table.insert(1, lit([1.0; 3], 15, 1));
+        let sections = sections(&[([2, 64, 0], 1)]);
+        let mut lights = RayLights::new(&device);
+        lights.start(table);
+        let camera = DVec3::new(0.5, 64.5, 0.5);
+        lights.update(&queue, camera, (&sections, MIN_Y), 1);
+        lights.clear();
+        lights.settle(&queue);
+        assert_eq!(lights.shown, None);
+        let empty = SectionLights::default();
+        lights.update(&queue, camera, (&empty, MIN_Y), 2);
+        assert!(lights.running && !lights.blank);
+        lights.settle(&queue);
+        assert_eq!(lights.shown, Some(grid_origin(camera)));
+        assert_eq!(lights.spare.words[0], 0);
+    }
+
+    /// A worker gone with a rebuild under way: the rebuild is asked again, and built on this
+    /// thread from then on.
+    #[test]
+    fn a_lost_worker_s_rebuild_is_built_here() {
+        let Some((_, device, queue)) = crate::gfx::test_gpu::optional_device() else {
+            return;
+        };
+        let mut table = Sources::default();
+        table.insert(1, lit([1.0; 3], 15, 1));
+        let sections = sections(&[([2, 64, 0], 1)]);
+        let mut lights = RayLights::new(&device);
+        lights.table = table;
+        let (jobs, _job_rx) = mpsc::channel();
+        let (_, done) = mpsc::channel();
+        lights.worker = Some(Worker { jobs, done });
+        let camera = DVec3::new(0.5, 64.5, 0.5);
+        (lights.running, lights.built) = (true, Some((grid_origin(camera), 1, Instant::now())));
+        lights.update(&queue, camera, (&sections, MIN_Y), 1);
+        assert!(lights.worker.is_none() && !lights.running);
+        assert_eq!(lights.shown, Some(grid_origin(camera)));
+        assert_eq!(lights.spare.words[0], 1);
+    }
+
+    /// Sections keyed from a level's own lowest block (below vanilla's): the sources deep in it
+    /// are found.
+    #[test]
+    fn the_sections_are_keyed_from_the_level_s_lowest_block() {
+        let mut table = Sources::default();
+        table.insert(1, lit([1.0; 3], 15, 1));
+        let min_y = -256;
+        let sections = sections_from(&[([2, -200, 0], 1)], min_y);
+        let camera = DVec3::new(0.5, -199.5, 0.5);
+        let origin = grid_origin(camera);
+        assert_eq!(build(&table, origin, camera, (&sections, min_y))[0], 1);
+        assert_eq!(build(&table, origin, camera, (&sections, MIN_Y))[0], 0);
     }
 
     /// A bench, not a check: the CPU cost of one rebuild on the worker, and the render thread's
     /// cost a frame (the gathering, the sending and the upload) with a rebuild asked every frame,
     /// in release (`--release -- --ignored --nocapture`), for 1024 sources spread over the grid,
-    /// 1024 packed in 16×4×16 blocks at the camera, and none. Kept as a regression bench: a
+    /// 1024 packed in 16×4×16 blocks at the camera, none, and the spread 1024 with 100 sections
+    /// full of lava around them (409,600 listed blocks, none a source), with the cost of
+    /// copying every listed block on the render thread, as the gathering did before it shared
+    /// the sections' lists. Kept as a regression bench: a
     /// rebuild on the render thread took about 2.3 ms for 1024 sources while it allocated a list
     /// a cell; the render thread's share should stay well under HDR pacing's 0.5 ms.
     #[test]
@@ -727,32 +844,51 @@ mod tests {
             .flat_map(|x| (0..4).flat_map(move |y| (0..16).map(move |z| (x, y, z))))
             .map(|(x, y, z)| ([x - 8, y + 62, z - 8], 1))
             .collect();
+        // Lava (state 2, not a source) fills sections -5 to 4 in x and z, blocks 48 to 63 high.
+        let lava = (-80..80)
+            .flat_map(|x| (48..64).flat_map(move |y| (-80..80).map(move |z| ([x, y, z], 2))));
+        let lava: Vec<_> = spread.iter().copied().chain(lava).collect();
         let device = crate::gfx::test_gpu::optional_device();
-        for (name, blocks) in [("spread", spread), ("packed", packed), ("none", Vec::new())] {
+        let cases = [
+            ("spread", spread, 1024),
+            ("packed", packed, 1024),
+            ("none", Vec::new(), 0),
+            ("spread + lava", lava, 1024),
+        ];
+        for (name, blocks, count) in cases {
             let sections = sections(&blocks);
             let origin = grid_origin(camera);
             let runs: u32 = 200;
             let (mut builder, mut job) = (Builder::default(), Job::default());
             (job.origin, job.camera) = (origin, camera);
-            gather(origin, &sections, &mut job.blocks);
+            gather(origin, MIN_Y, &sections, &mut job.blocks);
+            let start = Instant::now();
+            let copied: Vec<_> = job.blocks.iter().flat_map(|l| l.iter().copied()).collect();
+            let copy = start.elapsed().as_secs_f64() * 1e6;
+            assert_eq!(copied.len(), blocks.len());
             let start = Instant::now();
             for _ in 0..runs {
                 builder.build(&table, &mut job);
             }
             let built = start.elapsed().as_secs_f64() * 1e6 / f64::from(runs);
             let words = &job.words;
-            assert_eq!(words[0] as usize, blocks.len());
+            assert_eq!(words[0], count);
             let uploaded = RAY_LIGHT_HEADER + words[0] * RAY_LIGHT_WORDS + WORDS - COUNTS;
-            let mut line = format!("{name}: worker build {built:.0} µs, {} bytes", uploaded * 4);
+            let mut line = format!(
+                "{name}: worker build {built:.0} µs, {} bytes, copying the {} listed blocks {copy:.0} µs",
+                uploaded * 4,
+                blocks.len()
+            );
             if let Some((_, device, queue)) = &device {
-                let mut lights = RayLights::new(device, table.clone());
+                let mut lights = RayLights::new(device);
+                lights.start(table.clone());
                 let (mut took, mut uploads) = (Vec::new(), 0);
                 // A step to and fro every frame: a rebuild asked each, as source changes can't.
                 for frame in 0..runs {
                     let camera = camera + DVec3::X * f64::from(16 * (frame % 2));
                     let shown = lights.shown;
                     let start = Instant::now();
-                    lights.update(queue, camera, &sections, 0);
+                    lights.update(queue, camera, (&sections, MIN_Y), 0);
                     took.push(start.elapsed().as_secs_f64() * 1e6);
                     uploads += usize::from(lights.shown != shown);
                     queue.submit([]);

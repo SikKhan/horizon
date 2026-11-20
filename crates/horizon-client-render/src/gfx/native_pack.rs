@@ -317,9 +317,10 @@ impl NativePack {
             terrain.linear,
         );
         // One buffer of light sources for every stage of a `[ray_tracing] lights = true` pack
-        // whose files name them, on a device that traces.
+        // whose files name them, on a device that traces: the passes' bind groups take it as
+        // they are made. Its sources and worker wait for a pass that reads them (below).
         if report.stages.iter().any(CheckedStage::traces_lights) && super::rt::query::on(device) {
-            frame.ray_lights = Some(super::ray_lights::RayLights::new(device, sources));
+            frame.ray_lights = Some(super::ray_lights::RayLights::new(device));
         }
         let reach = report.manifest.kept.reach;
         frame.epochs = (kept.as_ref()).map(|_| super::native_post::kept::Epochs::new(reach));
@@ -509,6 +510,9 @@ impl NativePack {
         if !post.traces_lights() && !terrain_lights.is_some_and(|t| t.traces_lights()) {
             frame.ray_lights = None;
         }
+        if let Some(r) = &mut frame.ray_lights {
+            r.start(sources);
+        }
         let mut labels: Vec<String> = sky.iter().map(|s| s.label.clone()).collect();
         labels.extend(
             others
@@ -555,6 +559,7 @@ impl NativePack {
             output,
             lights,
             light_revision,
+            min_y,
             sky_visible,
             scene,
             lightmap,
@@ -570,7 +575,7 @@ impl NativePack {
             .update(queue, frame.camera, lights, light_revision);
         // Kept only while the passes trace: in a frame without the scene they miss anyway.
         if let (Some(r), Some(_)) = (&mut self.frame.ray_lights, &scene) {
-            r.update(queue, frame.camera, lights, light_revision);
+            r.update(queue, frame.camera, (lights, min_y), light_revision);
         }
         let Some(t) = &mut self.timing else {
             return false;

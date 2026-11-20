@@ -961,9 +961,9 @@ fn only_the_passes_that_name_the_light_sources_bind_them() {
     let mut pack = pack_with(&device, &queue, &scene, &manifest, &files, sources);
     let camera = glam::DVec3::new(0.5, 64.5, 0.5);
     let key = (0, (64 - crate::chunk::MIN_Y) / 16, 0);
-    let sections = [(key, vec![([2, 64, 0], 1)])].into_iter().collect();
+    let sections = [(key, vec![([2, 64, 0], 1)].into())].into_iter().collect();
     let lights = pack.frame.ray_lights.as_mut().expect("the light sources");
-    lights.update(&queue, camera, &sections, 1);
+    lights.update(&queue, camera, (&sections, crate::chunk::MIN_Y), 1);
     lights.settle(&queue);
     let got = frame(
         (&device, &queue, &world),

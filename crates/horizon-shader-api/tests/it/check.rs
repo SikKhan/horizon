@@ -1218,6 +1218,42 @@ fn the_light_sources_are_the_keyed_pack_s_that_names_them() {
     }
 }
 
+/// Two `[[post]]` entries of one file with different `files`: each binds the light sources by
+/// its own files, whichever comes first.
+#[test]
+fn post_entries_of_one_file_bind_the_light_sources_by_their_own_files() {
+    let post = "fn post(input: PostInput) -> vec4<f32> {\n    \
+                return vec4<f32>(shade(view_position(input.uv, input.depth)), 1.0);\n}\n";
+    let reads =
+        "fn shade(p: vec3<f32>) -> vec3<f32> { return vec3<f32>(f32(ray_lights_near(p).y)); }\n";
+    let plain = "fn shade(p: vec3<f32>) -> vec3<f32> { return p; }\n";
+    for (first, second, lit) in [
+        ("a.wgsl", "b.wgsl", [true, false]),
+        ("b.wgsl", "a.wgsl", [false, true]),
+    ] {
+        let manifest = format!(
+            "schema = 1\nid = \"p\"\nname = \"P\"\nversion = \"1\"\napi = \"0.2\"\n\
+             [ray_tracing]\nlights = true\n\
+             [[post]]\nname = \"one\"\nfile = \"post.wgsl\"\nfiles = [\"{first}\"]\n\
+             [[post]]\nname = \"two\"\nfile = \"post.wgsl\"\nfiles = [\"{second}\"]\n\
+             [tonemap]\nfile = \"tonemap.wgsl\"\n"
+        );
+        let files = [
+            (MANIFEST, manifest.as_str()),
+            ("post.wgsl", post),
+            ("a.wgsl", reads),
+            ("b.wgsl", plain),
+            ("tonemap.wgsl", TONEMAP),
+        ]
+        .map(|(n, t)| (n.to_owned(), t.as_bytes().to_vec()))
+        .into();
+        let report = check(&Pack::from_files(files).unwrap()).unwrap();
+        let posts = report.stages.iter().filter(|s| s.kind == StageKind::Post);
+        let got: Vec<bool> = posts.map(|s| s.traces_lights()).collect();
+        assert_eq!(got, lit, "{first} first");
+    }
+}
+
 /// A light function of the pack's own (`ray_light` in the post pass and in a material stage
 /// that traces nothing) stays the pack's without `lights = true`: the pack checks, its material
 /// isn't built against the scene, and every stage composes byte for byte as the same pack with

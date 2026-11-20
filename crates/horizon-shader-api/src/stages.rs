@@ -528,7 +528,7 @@ pub const RAY_ENTITY_SAMPLER_BINDING: u32 = 62;
 /// layer's, in the stream's layout and atlas: the last of the layer's bindings.
 pub const RAY_ENTITY_RETAINED_BINDING: u32 = 63;
 /// The light sources around the camera and a grid over them, only for a pack with
-/// `[ray_tracing] lights = true`, in the passes whose files name them (`names_ray_lights`): one
+/// `[ray_tracing] lights = true`, in the passes whose files name them (`CheckedStage::traces_lights`): one
 /// storage buffer of `u32`. `RAY_LIGHT_HEADER` words of header: the sources' count, the grid's
 /// cells a side, the side of a cell in blocks as `f32` bits, the most sources a cell lists, the
 /// grid's corner camera-relative as three `f32` (word 4, rewritten each frame), then where the
@@ -973,7 +973,7 @@ fn trace_any_layers(origin: vec3<f32>, direction: vec3<f32>, max_distance: f32, 
 }
 ";
 
-/// The light sources for a stage that names them (`names_ray_lights`), with the scene.
+/// The light sources for a stage whose files name them (`names_lights`), with the scene.
 const RAY_LIGHTS_SCENE: &str = "\
 // The light sources (blocks that give off light) within 64 blocks or so of the camera, the
 // nearest first, and a grid of 8-block cells over them, each listing the sources that reach it.
@@ -997,12 +997,17 @@ fn horizon_ray_light_vec(i: u32) -> vec3<f32> {
 fn ray_light_count() -> u32 {
     return horizon_ray_lights[0];
 }
-// The source `i`, below `ray_light_count()`; level 0 past it.
+// The source `i`, below `ray_light_count()`; level 0 past it (and for `ray_light_at`'s
+// 0xffffffffu).
 fn ray_light(i: u32) -> RayLight {
+    let none = RayLight(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0u);
     if i >= ray_light_count() {
-        return RayLight(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0u);
+        return none;
     }
     let at = 16u + i * 8u;
+    if at + 7u >= arrayLength(&horizon_ray_lights) {
+        return none;
+    }
     return RayLight(horizon_ray_light_vec(at) + horizon_ray_light_vec(4u),
         horizon_ray_light_float(at + 3u), horizon_decode(horizon_ray_light_vec(at + 4u)),
         horizon_ray_lights[at + 7u]);
@@ -1020,9 +1025,22 @@ fn ray_lights_near(position: vec3<f32>) -> vec2<u32> {
     let index = c.x + n * (c.y + n * c.z);
     return vec2<u32>(index * horizon_ray_lights[3], horizon_ray_lights[horizon_ray_lights[8] + index]);
 }
-// The index, for `ray_light`, of the source `i` of a cell's list (`ray_lights_near`).
+// The index, for `ray_light`, of the source `i` of a cell's list (`ray_lights_near`);
+// 0xffffffffu, which `ray_light` reads as no source, where `i` is past its cell's count.
 fn ray_light_at(i: u32) -> u32 {
-    return horizon_ray_lights[horizon_ray_lights[9] + i];
+    let n = horizon_ray_lights[1];
+    let per = max(horizon_ray_lights[3], 1u);
+    let counts = horizon_ray_lights[8];
+    let lists = horizon_ray_lights[9];
+    let length = arrayLength(&horizon_ray_lights);
+    let cell = i / per;
+    if cell >= n * n * n || counts >= length || cell >= length - counts {
+        return 0xffffffffu;
+    }
+    if i % per >= horizon_ray_lights[counts + cell] || lists >= length || i >= length - lists {
+        return 0xffffffffu;
+    }
+    return horizon_ray_lights[lists + i];
 }
 ";
 
@@ -1045,7 +1063,7 @@ fn ray_lights_near(position: vec3<f32>) -> vec2<u32> {
     return vec2<u32>(0u);
 }
 fn ray_light_at(i: u32) -> u32 {
-    return 0u;
+    return 0xffffffffu;
 }
 ";
 
@@ -1517,7 +1535,7 @@ impl StageKind {
     /// whose files name one of them (`names_jitter`).
     /// `looks`: a terrain hit reads its quad's look (`RAY_LOOKS`), for a stage that
     /// reads one (`check::RAY_LOOK_FIELDS`). With `lights` (the pack's files name the light
-    /// functions, `names_ray_lights`) the light sources are there.
+    /// functions, `names_lights`) the light sources are there.
     #[allow(clippy::too_many_arguments)]
     fn prelude_rays(
         self,
@@ -1973,15 +1991,8 @@ pub(crate) const LIGHT_NAMES: [&str; 5] = [
     "ray_light_at",
 ];
 
-/// Whether `pack` has `[ray_tracing] lights = true` and its files name one of the light
-/// functions or `RayLight` outside a comment: only then does a stage whose own files name one
-/// have them, and does the renderer keep the list of sources.
-pub fn names_ray_lights(pack: &Pack) -> bool {
-    lights_on(pack) && files_name(pack, &LIGHT_NAMES)
-}
-
 /// Whether `pack` has `[ray_tracing] lights = true`.
-fn lights_on(pack: &Pack) -> bool {
+pub(crate) fn lights_on(pack: &Pack) -> bool {
     (pack.manifest.ray_tracing.as_ref()).is_some_and(|r| r.lights)
 }
 

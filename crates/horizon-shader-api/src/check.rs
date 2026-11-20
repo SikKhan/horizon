@@ -17,7 +17,7 @@ use crate::package::Pack;
 use crate::stages::{
     Composed, GROUP, KEPT_BINDING, RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING,
     RAY_LIGHTS_BINDING, RAY_LOOKS_BINDING, RAY_SCENE_BINDING, StageKind, compose_traced,
-    identifiers,
+    identifiers, lights_on,
 };
 use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};
 use std::collections::HashSet;
@@ -100,7 +100,7 @@ impl CheckedStage {
     }
 
     /// Whether the stage against the scene reads the light sources: its own files name them
-    /// (`[ray_tracing] lights = true`, `names_ray_lights`), so the renderer binds their list in
+    /// (`[ray_tracing] lights = true`, `stages::names_lights`), so the renderer binds their list in
     /// this pass's layout (binding 80) and keeps it for the pack.
     pub fn traces_lights(&self) -> bool {
         self.scene.as_ref().is_some_and(|module| {
@@ -453,10 +453,15 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
         )
         .chain(m.post.iter().enumerate().map(|(i, s)| match s.compute {
             true => (StageKind::Compute, s, Some(i)),
-            // In a pack without kept resources or compute passes an ordinary pass keeps the first
-            // entry with its file, as such packs were built before, so they compose
-            // byte-identically; with them, each entry's own `reads` decide its declarations.
-            false => (StageKind::Post, s, m.computes().then_some(i)),
+            // In a pack without kept resources, compute passes or the light sources an ordinary
+            // pass keeps the first entry with its file, as such packs were built before, so they
+            // compose byte-identically; with them, each entry's own `reads` and `files` decide
+            // its declarations and whether it binds the light sources.
+            false => (
+                StageKind::Post,
+                s,
+                (m.computes() || lights_on(pack)).then_some(i),
+            ),
         }))
         .chain(m.tonemap.iter().map(|s| (StageKind::Tonemap, s, None)))
         .chain(m.entity.iter().map(|s| (StageKind::Entity, s, None)));

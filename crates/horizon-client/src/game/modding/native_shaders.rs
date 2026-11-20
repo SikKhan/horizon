@@ -273,9 +273,11 @@ impl Game<'_> {
                 }
             }
             // Each light source a `[ray_tracing] lights = true` pack's rays read: its
-            // `[[lights]]` colour, its level and its model's `[[materials]]` id (lava left out).
+            // `[[lights]]` colour, its level and its model's `[[materials]]` id (lava left out),
+            // where a stage reads them and the device traces.
             let mut sources = horizon_client::gfx::ray_lights::Sources::default();
-            if horizon_shader_api::stages::names_ray_lights(&pack) {
+            let traces_lights = report.stages.iter().any(|s| s.traces_lights());
+            if traces_lights && renderer.ray_queries() {
                 let catalog = &self.pack.render.model_catalog;
                 let origin = horizon_core::position::BlockPos::new(0, 0, 0);
                 for (id, state) in self.res.facts().states.iter().enumerate() {
