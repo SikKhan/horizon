@@ -759,9 +759,9 @@ mod tests {
                     // About a frame at 240 fps.
                     std::thread::sleep(Duration::from_millis(4));
                 }
-                // The first frame makes the staging memory; the rest is the steady state.
+                // The first frame only sends the first job (nothing is built yet to upload).
                 let first = took.remove(0);
-                let mean = took.iter().sum::<f64>() / took.len() as f64;
+                let mean = took.iter().sum::<f64>() / f64::from(runs - 1);
                 took.sort_by(f64::total_cmp);
                 let (p99, most) = (took[took.len() * 99 / 100], took[took.len() - 1]);
                 line += &format!(
