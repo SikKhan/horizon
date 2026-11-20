@@ -964,6 +964,7 @@ fn only_the_passes_that_name_the_light_sources_bind_them() {
     let sections = [(key, vec![([2, 64, 0], 1)])].into_iter().collect();
     let lights = pack.frame.ray_lights.as_mut().expect("the light sources");
     lights.update(&queue, camera, &sections, 1);
+    lights.settle(&queue);
     let got = frame(
         (&device, &queue, &world),
         &mut pack,

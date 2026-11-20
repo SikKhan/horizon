@@ -222,7 +222,9 @@ fn ray_tracing() -> String {
          the data, and the grid a convenience built from it with fixed choices (8-block cells, 16 a side around the\n  \
          camera, at most 24 a cell, ranked by vanilla's falloff, level minus distance, at the cell's nearest point): a\n  \
          pack that wants others reads the list and builds its own grid into a kept buffer in a compute or\n  \
-         `[[before_world]]` pass. The list only says where sources are: trace towards one (`trace_any`) to know whether\n  \
+         `[[before_world]]` pass. Both are rebuilt off the render thread when the camera crosses a 16-block step, and\n  \
+         at most every 100 ms when a source block changes, and reach the passes a frame or two later; their positions\n  \
+         stay relative to the current camera meanwhile. The list only says where sources are: trace towards one (`trace_any`) to know whether\n  \
          its light gets through. A full glowing cube (glowstone, a sea lantern) is in the scene itself, so a ray aimed\n  \
          at its centre is stopped by the source: end the ray where it enters the source's block (as\n  \
          `packs/traced_lights` does), or take a hit within the block as the source.\n\n\

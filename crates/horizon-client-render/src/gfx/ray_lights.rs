@@ -14,12 +14,16 @@ use horizon_shader_api::stages::{
     RAY_LIGHT_CELL, RAY_LIGHT_GRID, RAY_LIGHT_HEADER, RAY_LIGHT_MAX, RAY_LIGHT_PER_CELL,
     RAY_LIGHT_WORDS,
 };
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use super::SectionKey;
 use horizon_items::blocks::Fluid;
 
 /// The grid moves in steps of this many blocks.
 const STEP: i32 = 16;
+/// The least time between two rebuilds for changed sources alone (the grid not moved).
+const SOURCE_REBUILDS: Duration = Duration::from_millis(100);
 /// Where the cells' counts start, and then their lists: after the header and the sources.
 const COUNTS: u32 = RAY_LIGHT_HEADER + RAY_LIGHT_MAX * RAY_LIGHT_WORDS;
 const CELLS: u32 = RAY_LIGHT_GRID * RAY_LIGHT_GRID * RAY_LIGHT_GRID;
@@ -68,10 +72,57 @@ fn material_of(layers: impl IntoIterator<Item = u32>, materials: &[(u32, u32)]) 
 
 pub struct RayLights {
     pub buffer: wgpu::Buffer,
-    /// Each listed block state's colour, level and material.
+    /// The world corner and the sources' revision last asked for, and when.
+    built: Option<([i32; 3], u64, Instant)>,
+    /// A rebuild is asked for and waits for the worker to be free: the latest state is sent
+    /// then, so the latest request wins.
+    wanted: bool,
+    /// The corner of the words the buffer holds, which positions are written against.
+    shown: Option<[i32; 3]>,
+    /// The worker, whether it runs a rebuild, and the buffers of the last one, for the next.
+    worker: Option<Worker>,
+    running: bool,
+    spare: Job,
+    /// Builds on this thread where the worker couldn't start.
     table: Sources,
-    /// The world corner and the sources' revision the buffer was last built for.
-    built: Option<([i32; 3], u64)>,
+    builder: Builder,
+}
+
+/// A rebuild for the worker: the grid's corner, the camera, the light-giving blocks of the
+/// sections in its reach (`gather`), and the words to build into.
+#[derive(Default)]
+struct Job {
+    origin: [i32; 3],
+    camera: DVec3,
+    blocks: Vec<([i32; 3], u32)>,
+    words: Vec<u32>,
+}
+
+/// The thread that builds the words (`Builder`), so a rebuild costs the render thread only the
+/// gathering and the upload.
+struct Worker {
+    jobs: Sender<Job>,
+    done: Receiver<Job>,
+}
+
+impl Worker {
+    fn spawn(table: Sources) -> Option<Self> {
+        let (jobs, job_rx) = mpsc::channel::<Job>();
+        let (done_tx, done) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("ray lights".into())
+            .spawn(move || {
+                let mut builder = Builder::default();
+                while let Ok(mut job) = job_rx.recv() {
+                    builder.build(&table, &mut job);
+                    if done_tx.send(job).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { jobs, done })
+    }
 }
 
 impl RayLights {
@@ -84,13 +135,21 @@ impl RayLights {
         });
         Self {
             buffer,
-            table,
             built: None,
+            wanted: false,
+            shown: None,
+            worker: Worker::spawn(table.clone()),
+            running: false,
+            spare: Job::default(),
+            table,
+            builder: Builder::default(),
         }
     }
 
-    /// Places the grid around `camera`, rebuilding the sources and the cells when it moved or
-    /// `revision` (of `sections`' sources) changed.
+    /// Places the grid around `camera`. The sources and the cells are rebuilt, on the worker,
+    /// when it moved on to another step, or when `revision` (of `sections`' sources) changed, at
+    /// most every `SOURCE_REBUILDS` for that (a redstone clock would otherwise rebuild every
+    /// frame); a frame uploads them once they are built, a frame or two later.
     pub fn update(
         &mut self,
         queue: &wgpu::Queue,
@@ -98,15 +157,84 @@ impl RayLights {
         sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
         revision: u64,
     ) {
-        let origin = grid_origin(camera);
-        if self.built != Some((origin, revision)) {
-            self.built = Some((origin, revision));
-            let words = build(&self.table, origin, camera, sections);
-            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&words));
+        if let Some(job) = self.worker.as_ref().and_then(|w| w.done.try_recv().ok()) {
+            self.running = false;
+            self.upload(queue, job);
         }
-        let corner = (IVec3::from(origin).as_dvec3() - camera).as_vec3();
-        let corner = corner.to_array().map(f32::to_bits);
-        queue.write_buffer(&self.buffer, 16, bytemuck::cast_slice(&corner));
+        let (origin, now) = (grid_origin(camera), Instant::now());
+        if due(self.built, origin, revision, now) {
+            self.built = Some((origin, revision, now));
+            self.wanted = true;
+        }
+        if self.wanted && !self.running {
+            self.wanted = false;
+            let mut job = std::mem::take(&mut self.spare);
+            (job.origin, job.camera) = (origin, camera);
+            gather(origin, sections, &mut job.blocks);
+            match &self.worker {
+                Some(w) => match w.jobs.send(job) {
+                    Ok(()) => self.running = true,
+                    // The worker is gone: build here from now on.
+                    Err(mpsc::SendError(job)) => {
+                        self.worker = None;
+                        self.build_here(queue, job);
+                    }
+                },
+                None => self.build_here(queue, job),
+            }
+        }
+        // Against the corner of the words the buffer holds, which only an upload moves.
+        if let Some(shown) = self.shown {
+            let corner = (IVec3::from(shown).as_dvec3() - camera).as_vec3();
+            let corner = corner.to_array().map(f32::to_bits);
+            queue.write_buffer(&self.buffer, 16, bytemuck::cast_slice(&corner));
+        }
+    }
+
+    fn build_here(&mut self, queue: &wgpu::Queue, mut job: Job) {
+        self.builder.build(&self.table, &mut job);
+        self.upload(queue, job);
+    }
+
+    /// Uploads the built `job`'s words: the header and its sources, then every cell's count
+    /// and list (the sources past its count, left from an earlier build, are never read).
+    fn upload(&mut self, queue: &wgpu::Queue, job: Job) {
+        let words = &job.words;
+        let sources = (RAY_LIGHT_HEADER + words[0] * RAY_LIGHT_WORDS) as usize;
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&words[..sources]));
+        let cells = bytemuck::cast_slice(&words[COUNTS as usize..]);
+        queue.write_buffer(&self.buffer, u64::from(COUNTS) * 4, cells);
+        self.shown = Some(job.origin);
+        self.spare = job;
+    }
+
+    /// Waits for the worker's rebuild, if one runs, and uploads it: a test's next frame then
+    /// reads it.
+    #[cfg(test)]
+    pub(in crate::gfx) fn settle(&mut self, queue: &wgpu::Queue) {
+        if let Some(job) = (self.worker.as_ref())
+            .filter(|_| self.running)
+            .and_then(|w| w.done.recv().ok())
+        {
+            self.running = false;
+            self.upload(queue, job);
+        }
+    }
+}
+
+/// Whether to rebuild the grid last `built` (its corner, revision and when) for the corner
+/// `origin` and the sources' `revision` at `now`: at once for a new corner, at most every
+/// `SOURCE_REBUILDS` for new sources alone.
+fn due(
+    built: Option<([i32; 3], u64, Instant)>,
+    origin: [i32; 3],
+    revision: u64,
+    now: Instant,
+) -> bool {
+    match built {
+        None => true,
+        Some((o, _, _)) if o != origin => true,
+        Some((_, r, at)) => r != revision && now.duration_since(at) >= SOURCE_REBUILDS,
     }
 }
 
@@ -120,94 +248,205 @@ fn grid_origin(camera: DVec3) -> [i32; 3] {
         .map(|v| v * STEP)
 }
 
-/// The buffer's words for the grid with its corner at `origin` (the corner itself left 0: the
-/// frame writes it).
+/// The light-giving blocks of the sections that the grid at `origin`, or light reaching into
+/// it (15 blocks), touches, into `blocks`: only the sections in that range are looked up, not
+/// the whole map, which may hold the render distance.
+fn gather(
+    origin: [i32; 3],
+    sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
+    blocks: &mut Vec<([i32; 3], u32)>,
+) {
+    let span = RAY_LIGHT_GRID as i32 * RAY_LIGHT_CELL as i32;
+    let lo = origin.map(|v| (v - 15).div_euclid(16));
+    let hi = origin.map(|v| (v + span + 15).div_euclid(16));
+    let below = crate::chunk::MIN_Y.div_euclid(16);
+    blocks.clear();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if let Some(lights) = sections.get(&(x, y - below, z)) {
+                    blocks.extend_from_slice(lights);
+                }
+            }
+        }
+    }
+}
+
+/// A source found for the grid: its block, its centre from the grid's corner, its colour, level
+/// and material, and its distance² to the camera.
+#[derive(Clone, Copy)]
+struct Found {
+    block: [i32; 3],
+    at: Vec3,
+    color: [f32; 3],
+    level: f32,
+    material: u32,
+    distance: f64,
+}
+
+/// The nearest the camera first; a tie by block, so the order never depends on the map's.
+fn nearest_first(a: &Found, b: &Found) -> std::cmp::Ordering {
+    (a.distance.total_cmp(&b.distance)).then(a.block.cmp(&b.block))
+}
+
+/// The sources of `blocks` (`gather`) that `table` lists, the nearest `RAY_LIGHT_MAX` to
+/// `camera`, nearest first, into `found`.
+fn find(
+    table: &Sources,
+    (origin, camera): ([i32; 3], DVec3),
+    blocks: &[([i32; 3], u32)],
+    found: &mut Vec<Found>,
+) {
+    let corner = IVec3::from(origin).as_dvec3();
+    found.clear();
+    for &(block, state) in blocks {
+        let Some(source) = table.get(&state) else {
+            continue;
+        };
+        let center = IVec3::from(block).as_dvec3() + 0.5;
+        found.push(Found {
+            block,
+            at: (center - corner).as_vec3(),
+            color: source.color,
+            level: f32::from(source.level),
+            material: source.material,
+            distance: center.distance_squared(camera),
+        });
+    }
+    let max = RAY_LIGHT_MAX as usize;
+    if found.len() > max {
+        found.select_nth_unstable_by(max, nearest_first);
+        found.truncate(max);
+    }
+    found.sort_unstable_by(nearest_first);
+}
+
+/// The cells the light of a source at `at` reaching `reach` blocks touches, as the first and the
+/// last on each axis, if any.
+fn reached(at: Vec3, reach: f32) -> Option<(IVec3, IVec3)> {
+    let n = RAY_LIGHT_GRID as f32;
+    let first = ((at - reach) / RAY_LIGHT_CELL).floor().max(Vec3::ZERO);
+    let last = ((at + reach) / RAY_LIGHT_CELL)
+        .floor()
+        .min(Vec3::splat(n - 1.0));
+    (!first.cmpgt(last).any()).then(|| (first.as_ivec3(), last.as_ivec3()))
+}
+
+/// How much of a source's light at `at` reaching `reach` blocks is left at the cell `cell`'s
+/// nearest point: the strength the cells rank their sources by.
+fn left_at(at: Vec3, reach: f32, cell: IVec3) -> f32 {
+    let low = cell.as_vec3() * RAY_LIGHT_CELL;
+    let near = at.clamp(low, low + RAY_LIGHT_CELL);
+    reach - near.distance(at)
+}
+
+/// What it takes to build the buffer's words, kept between rebuilds, so a rebuild into words
+/// of an earlier one allocates nothing.
+#[derive(Default)]
+struct Builder {
+    /// The strength of each cell's listed sources, in the lists' slots.
+    strengths: Vec<f32>,
+    found: Vec<Found>,
+}
+
+impl Builder {
+    /// Rebuilds `job`'s words for its grid and blocks (the corner itself left as it was: the
+    /// frame writes it). The source words past the count are cleared, and a cell's slots past
+    /// its count keep what they held: nothing reads them.
+    fn build(&mut self, table: &Sources, job: &mut Job) {
+        let per = RAY_LIGHT_PER_CELL as usize;
+        if job.words.len() != WORDS as usize {
+            job.words = vec![0; WORDS as usize];
+        }
+        if self.strengths.len() != CELLS as usize * per {
+            self.strengths = vec![0.0; CELLS as usize * per];
+        }
+        find(
+            table,
+            (job.origin, job.camera),
+            &job.blocks,
+            &mut self.found,
+        );
+        let words = &mut job.words;
+        words[1] = RAY_LIGHT_GRID;
+        words[2] = RAY_LIGHT_CELL.to_bits();
+        words[3] = RAY_LIGHT_PER_CELL;
+        words[8] = COUNTS;
+        words[9] = LISTS;
+        let (before, now) = (words[0], self.found.len() as u32);
+        words[0] = now;
+        let source_words = |count: u32| (RAY_LIGHT_HEADER + count * RAY_LIGHT_WORDS) as usize;
+        if before > now {
+            words[source_words(now)..source_words(before)].fill(0);
+        }
+        for (i, s) in self.found.iter().enumerate() {
+            let w = source_words(i as u32);
+            let floats = [
+                s.at.x, s.at.y, s.at.z, s.level, s.color[0], s.color[1], s.color[2],
+            ];
+            for (k, f) in floats.into_iter().enumerate() {
+                words[w + k] = f.to_bits();
+            }
+            words[w + 7] = s.material;
+        }
+        // Each cell's sources: those whose light (as far as its level) reaches the cell's box,
+        // the strongest at the cell's nearest point first, the earlier source first on a tie.
+        let (counts, lists) = words[COUNTS as usize..].split_at_mut(CELLS as usize);
+        counts.fill(0);
+        let n = RAY_LIGHT_GRID as usize;
+        for (i, s) in self.found.iter().enumerate() {
+            let Some((first, last)) = reached(s.at, s.level) else {
+                continue;
+            };
+            for z in first.z..=last.z {
+                for y in first.y..=last.y {
+                    for x in first.x..=last.x {
+                        let left = left_at(s.at, s.level, IVec3::new(x, y, z));
+                        if left <= 0.0 {
+                            continue;
+                        }
+                        let c = x as usize + n * (y as usize + n * z as usize);
+                        let slots = c * per..(c + 1) * per;
+                        let strengths = &mut self.strengths[slots.clone()];
+                        let list = &mut lists[slots];
+                        let count = counts[c] as usize;
+                        // After every listed source at least as strong.
+                        let mut at = count;
+                        while at > 0 && strengths[at - 1] < left {
+                            at -= 1;
+                        }
+                        if at == per {
+                            continue;
+                        }
+                        let end = count.min(per - 1);
+                        strengths.copy_within(at..end, at + 1);
+                        list.copy_within(at..end, at + 1);
+                        strengths[at] = left;
+                        list[at] = i as u32;
+                        counts[c] = (count + 1).min(per) as u32;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The buffer's words for the grid with its corner at `origin`, from a builder of their own.
+#[cfg(test)]
 fn build(
     table: &Sources,
     origin: [i32; 3],
     camera: DVec3,
     sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
 ) -> Vec<u32> {
-    let n = RAY_LIGHT_GRID as usize;
-    let mut words = vec![0u32; WORDS as usize];
-    words[1] = RAY_LIGHT_GRID;
-    words[2] = RAY_LIGHT_CELL.to_bits();
-    words[3] = RAY_LIGHT_PER_CELL;
-    words[8] = COUNTS;
-    words[9] = LISTS;
-    let span = RAY_LIGHT_GRID as i32 * RAY_LIGHT_CELL as i32;
-    // Sections the grid or the light reaching into it (15 blocks) touches.
-    let lo = origin.map(|v| (v - 15).div_euclid(16));
-    let hi = origin.map(|v| (v + span + 15).div_euclid(16));
-    // (position from the corner, colour, level, distance² to the camera, material)
-    let mut sources: Vec<(Vec3, [f32; 3], f32, f64, u32)> = Vec::new();
-    for (key, lights) in sections {
-        let key = [key.0, key.1 + crate::chunk::MIN_Y.div_euclid(16), key.2];
-        if (0..3).any(|i| key[i] < lo[i] || key[i] > hi[i]) {
-            continue;
-        }
-        for &(pos, state) in lights {
-            let Some(source) = table.get(&state) else {
-                continue;
-            };
-            let center = IVec3::from(pos).as_dvec3() + 0.5;
-            let local = (center - IVec3::from(origin).as_dvec3()).as_vec3();
-            let d = center.distance_squared(camera);
-            let level = f32::from(source.level);
-            sources.push((local, source.color, level, d, source.material));
-        }
-    }
-    let max = RAY_LIGHT_MAX as usize;
-    if sources.len() > max {
-        sources.select_nth_unstable_by(max, |a, b| a.3.total_cmp(&b.3));
-        sources.truncate(max);
-    }
-    sources.sort_unstable_by(|a, b| a.3.total_cmp(&b.3));
-    words[0] = sources.len() as u32;
-    for (i, (at, color, level, _, material)) in sources.iter().enumerate() {
-        let w = (RAY_LIGHT_HEADER + i as u32 * RAY_LIGHT_WORDS) as usize;
-        let floats = [at.x, at.y, at.z, *level, color[0], color[1], color[2]];
-        for (k, f) in floats.into_iter().enumerate() {
-            words[w + k] = f.to_bits();
-        }
-        words[w + 7] = *material;
-    }
-    // Each cell's sources: those whose light (as far as its level) reaches the cell's box,
-    // the strongest at the cell's nearest point first.
-    let mut cells: Vec<Vec<(f32, u32)>> = vec![Vec::new(); n * n * n];
-    for (i, (at, _, reach, _, _)) in sources.iter().enumerate() {
-        let first = ((*at - *reach) / RAY_LIGHT_CELL).floor().max(Vec3::ZERO);
-        let last = ((*at + *reach) / RAY_LIGHT_CELL)
-            .floor()
-            .min(Vec3::splat(n as f32 - 1.0));
-        if first.cmpgt(last).any() {
-            continue;
-        }
-        let (first, last) = (first.as_ivec3(), last.as_ivec3());
-        for z in first.z..=last.z {
-            for y in first.y..=last.y {
-                for x in first.x..=last.x {
-                    let low = IVec3::new(x, y, z).as_vec3() * RAY_LIGHT_CELL;
-                    let near = at.clamp(low, low + RAY_LIGHT_CELL);
-                    let left = reach - near.distance(*at);
-                    if left > 0.0 {
-                        cells[x as usize + n * (y as usize + n * z as usize)]
-                            .push((left, i as u32));
-                    }
-                }
-            }
-        }
-    }
-    let per = RAY_LIGHT_PER_CELL as usize;
-    for (c, list) in cells.iter_mut().enumerate() {
-        list.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-        list.truncate(per);
-        words[COUNTS as usize + c] = list.len() as u32;
-        for (k, &(_, i)) in list.iter().enumerate() {
-            words[LISTS as usize + c * per + k] = i;
-        }
-    }
-    words
+    let mut job = Job {
+        origin,
+        camera,
+        ..Job::default()
+    };
+    gather(origin, sections, &mut job.blocks);
+    Builder::default().build(table, &mut job);
+    job.words
 }
 
 #[cfg(test)]
@@ -292,9 +531,188 @@ mod tests {
         assert_eq!(source((0, Fluid::None), orange, [3], &materials), None);
     }
 
-    /// The CPU cost of one rebuild and its upload, in release (`--release -- --ignored
-    /// --nocapture`): 1024 sources spread over the grid, 1024 packed in 16×4×16 blocks at the
-    /// camera, and none.
+    /// The builder before it kept its words: every section of the map walked, a `Vec` a cell,
+    /// sorted (stably: the earlier source first on a tie) and cut to 24.
+    fn reference(
+        table: &Sources,
+        origin: [i32; 3],
+        camera: DVec3,
+        sections: &FxHashMap<SectionKey, Vec<([i32; 3], u32)>>,
+    ) -> Vec<u32> {
+        let n = RAY_LIGHT_GRID as usize;
+        let mut words = vec![0u32; WORDS as usize];
+        words[1] = RAY_LIGHT_GRID;
+        words[2] = RAY_LIGHT_CELL.to_bits();
+        words[3] = RAY_LIGHT_PER_CELL;
+        words[8] = COUNTS;
+        words[9] = LISTS;
+        let span = RAY_LIGHT_GRID as i32 * RAY_LIGHT_CELL as i32;
+        let lo = origin.map(|v| (v - 15).div_euclid(16));
+        let hi = origin.map(|v| (v + span + 15).div_euclid(16));
+        let mut sources = Vec::new();
+        for (key, lights) in sections {
+            let key = [key.0, key.1 + crate::chunk::MIN_Y.div_euclid(16), key.2];
+            if (0..3).any(|i| key[i] < lo[i] || key[i] > hi[i]) {
+                continue;
+            }
+            for &(block, state) in lights {
+                let Some(source) = table.get(&state) else {
+                    continue;
+                };
+                let center = IVec3::from(block).as_dvec3() + 0.5;
+                sources.push(Found {
+                    block,
+                    at: (center - IVec3::from(origin).as_dvec3()).as_vec3(),
+                    color: source.color,
+                    level: f32::from(source.level),
+                    material: source.material,
+                    distance: center.distance_squared(camera),
+                });
+            }
+        }
+        sources.sort_by(nearest_first);
+        sources.truncate(RAY_LIGHT_MAX as usize);
+        words[0] = sources.len() as u32;
+        for (i, s) in sources.iter().enumerate() {
+            let w = (RAY_LIGHT_HEADER + i as u32 * RAY_LIGHT_WORDS) as usize;
+            let floats = [
+                s.at.x, s.at.y, s.at.z, s.level, s.color[0], s.color[1], s.color[2],
+            ];
+            for (k, f) in floats.into_iter().enumerate() {
+                words[w + k] = f.to_bits();
+            }
+            words[w + 7] = s.material;
+        }
+        let mut cells: Vec<Vec<(f32, u32)>> = vec![Vec::new(); n * n * n];
+        for (i, s) in sources.iter().enumerate() {
+            let Some((first, last)) = reached(s.at, s.level) else {
+                continue;
+            };
+            for z in first.z..=last.z {
+                for y in first.y..=last.y {
+                    for x in first.x..=last.x {
+                        let left = left_at(s.at, s.level, IVec3::new(x, y, z));
+                        if left > 0.0 {
+                            cells[x as usize + n * (y as usize + n * z as usize)]
+                                .push((left, i as u32));
+                        }
+                    }
+                }
+            }
+        }
+        let per = RAY_LIGHT_PER_CELL as usize;
+        for (c, list) in cells.iter_mut().enumerate() {
+            list.sort_by(|a, b| b.0.total_cmp(&a.0));
+            list.truncate(per);
+            words[COUNTS as usize + c] = list.len() as u32;
+            for (k, &(_, i)) in list.iter().enumerate() {
+                words[LISTS as usize + c * per + k] = i;
+            }
+        }
+        words
+    }
+
+    /// `count` sources of four levels at random blocks around `camera` (some out of the grid's
+    /// reach), and a quarter of them packed in 8 blocks, whose cells overflow 24.
+    fn random_blocks(seed: u64, count: usize, camera: [i32; 3]) -> Vec<([i32; 3], u32)> {
+        let mut state = seed;
+        let mut next = |below: i32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) % below as u64) as i32
+        };
+        // One state a block, as in a world.
+        let blocks: std::collections::BTreeMap<_, _> = (0..count)
+            .map(|i| {
+                let spread = if i % 4 == 0 { 8 } else { 180 };
+                let block = camera.map(|c| c + next(spread) - spread / 2);
+                (block, 1 + next(4) as u32)
+            })
+            .collect();
+        blocks.into_iter().collect()
+    }
+
+    /// The kept builder's words are the reference builder's, for random sources past the
+    /// 1024 cap and cells past 24; built again into the same words for other sources, every
+    /// word a shader reads (the header, the sources, the counts, each cell's listed slots) is
+    /// the reference's too.
+    #[test]
+    fn the_kept_builder_lists_what_the_reference_builder_does() {
+        let mut table = Sources::default();
+        for (state, level) in [(1, 15), (2, 14), (3, 7), (4, 3)] {
+            table.insert(state, lit([0.5, 1.0, 0.25], level, state * 10));
+        }
+        let (mut builder, mut job) = (Builder::default(), Job::default());
+        for (seed, count, camera) in [
+            (1, 1500, [3, 70, -9]),
+            (2, 300, [40, 20, 17]),
+            (3, 1200, [3, 70, -9]),
+        ] {
+            let sections = sections(&random_blocks(seed, count, camera));
+            let camera = IVec3::from(camera).as_dvec3() + 0.3;
+            let origin = grid_origin(camera);
+            let want = reference(&table, origin, camera, &sections);
+            assert_eq!(build(&table, origin, camera, &sections), want);
+            let full = (0..CELLS as usize).filter(|&c| want[COUNTS as usize + c] == 24);
+            assert!(seed == 2 || full.count() > 0, "no cell overflows");
+            (job.origin, job.camera) = (origin, camera);
+            gather(origin, &sections, &mut job.blocks);
+            builder.build(&table, &mut job);
+            let got = &job.words;
+            assert_eq!(
+                got[..COUNTS as usize],
+                want[..COUNTS as usize],
+                "seed {seed}"
+            );
+            for c in 0..CELLS as usize {
+                let count = want[COUNTS as usize + c] as usize;
+                assert_eq!(got[COUNTS as usize + c] as usize, count);
+                let at = LISTS as usize + c * RAY_LIGHT_PER_CELL as usize;
+                assert_eq!(got[at..at + count], want[at..at + count], "seed {seed}");
+            }
+        }
+    }
+
+    /// A new corner rebuilds at once; changed sources alone at most every 100 ms; nothing
+    /// changed, never.
+    #[test]
+    fn source_only_rebuilds_wait_100_ms() {
+        let start = Instant::now();
+        let built = Some(([0, 0, 0], 7, start));
+        let later = |ms| start + Duration::from_millis(ms);
+        assert!(due(None, [0, 0, 0], 7, start));
+        assert!(due(built, [16, 0, 0], 7, later(1)));
+        assert!(!due(built, [0, 0, 0], 8, later(99)));
+        assert!(due(built, [0, 0, 0], 8, later(100)));
+        assert!(!due(built, [0, 0, 0], 7, later(1000)));
+    }
+
+    /// Waits on a test's worker for its rebuild, and uploads it: the next frame reads it.
+    #[test]
+    fn the_worker_s_rebuild_is_uploaded_with_its_own_corner() {
+        let Some((_, device, queue)) = crate::gfx::test_gpu::optional_device() else {
+            return;
+        };
+        let mut table = Sources::default();
+        table.insert(1, lit([1.0; 3], 15, 1));
+        let sections = sections(&[([2, 64, 0], 1)]);
+        let mut lights = RayLights::new(&device, table);
+        assert!(lights.worker.is_some());
+        let camera = DVec3::new(0.5, 64.5, 0.5);
+        lights.update(&queue, camera, &sections, 1);
+        assert!(lights.running && lights.shown.is_none());
+        lights.settle(&queue);
+        assert_eq!(lights.shown, Some(grid_origin(camera)));
+        assert_eq!(lights.spare.words[0], 1);
+    }
+
+    /// A bench, not a check: the CPU cost of one rebuild on the worker, and the render thread's
+    /// cost a frame (the gathering, the sending and the upload) with a rebuild asked every frame,
+    /// in release (`--release -- --ignored --nocapture`), for 1024 sources spread over the grid,
+    /// 1024 packed in 16×4×16 blocks at the camera, and none. Kept as a regression bench: a
+    /// rebuild on the render thread took about 2.3 ms for 1024 sources while it allocated a list
+    /// a cell; the render thread's share should stay well under HDR pacing's 0.5 ms.
     #[test]
     #[ignore = "timing"]
     fn rebuild_timings() {
@@ -314,23 +732,42 @@ mod tests {
             let sections = sections(&blocks);
             let origin = grid_origin(camera);
             let runs: u32 = 200;
-            let start = std::time::Instant::now();
-            let mut words = Vec::new();
+            let (mut builder, mut job) = (Builder::default(), Job::default());
+            (job.origin, job.camera) = (origin, camera);
+            gather(origin, &sections, &mut job.blocks);
+            let start = Instant::now();
             for _ in 0..runs {
-                words = build(&table, origin, camera, &sections);
+                builder.build(&table, &mut job);
             }
             let built = start.elapsed().as_secs_f64() * 1e6 / f64::from(runs);
+            let words = &job.words;
             assert_eq!(words[0] as usize, blocks.len());
-            let mut line = format!("{name}: build {built:.0} µs, {} bytes", words.len() * 4);
+            let uploaded = RAY_LIGHT_HEADER + words[0] * RAY_LIGHT_WORDS + WORDS - COUNTS;
+            let mut line = format!("{name}: worker build {built:.0} µs, {} bytes", uploaded * 4);
             if let Some((_, device, queue)) = &device {
                 let mut lights = RayLights::new(device, table.clone());
-                let start = std::time::Instant::now();
-                for revision in 0..runs {
-                    lights.update(queue, camera, &sections, u64::from(revision));
+                let (mut took, mut uploads) = (Vec::new(), 0);
+                // A step to and fro every frame: a rebuild asked each, as source changes can't.
+                for frame in 0..runs {
+                    let camera = camera + DVec3::X * f64::from(16 * (frame % 2));
+                    let shown = lights.shown;
+                    let start = Instant::now();
+                    lights.update(queue, camera, &sections, 0);
+                    took.push(start.elapsed().as_secs_f64() * 1e6);
+                    uploads += usize::from(lights.shown != shown);
                     queue.submit([]);
+                    // About a frame at 240 fps.
+                    std::thread::sleep(Duration::from_millis(4));
                 }
-                let updated = start.elapsed().as_secs_f64() * 1e6 / f64::from(runs);
-                line += &format!(", rebuild + upload {updated:.0} µs a frame");
+                // The first frame makes the staging memory; the rest is the steady state.
+                let first = took.remove(0);
+                let mean = took.iter().sum::<f64>() / took.len() as f64;
+                took.sort_by(f64::total_cmp);
+                let (p99, most) = (took[took.len() * 99 / 100], took[took.len() - 1]);
+                line += &format!(
+                    ", render thread first {first:.0} µs, then {mean:.0} µs a frame \
+                     (99% under {p99:.0}, most {most:.0}), {uploads} uploads"
+                );
             }
             eprintln!("{line}");
         }

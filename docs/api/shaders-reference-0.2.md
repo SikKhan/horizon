@@ -404,7 +404,9 @@ asks for ray queries and keeps the scene with any pack or none; any other value 
   the data, and the grid a convenience built from it with fixed choices (8-block cells, 16 a side around the
   camera, at most 24 a cell, ranked by vanilla's falloff, level minus distance, at the cell's nearest point): a
   pack that wants others reads the list and builds its own grid into a kept buffer in a compute or
-  `[[before_world]]` pass. The list only says where sources are: trace towards one (`trace_any`) to know whether
+  `[[before_world]]` pass. Both are rebuilt off the render thread when the camera crosses a 16-block step, and
+  at most every 100 ms when a source block changes, and reach the passes a frame or two later; their positions
+  stay relative to the current camera meanwhile. The list only says where sources are: trace towards one (`trace_any`) to know whether
   its light gets through. A full glowing cube (glowstone, a sea lantern) is in the scene itself, so a ray aimed
   at its centre is stopped by the source: end the ray where it enters the source's block (as
   `packs/traced_lights` does), or take a hit within the block as the source.

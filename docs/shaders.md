@@ -357,7 +357,7 @@ own, and a pass that doesn't name them doesn't bind them (one storage buffer few
 | `ray_light(i)`, `ray_light_count()` | The source `i` of the whole list, below `ray_light_count()` (level 0 past it) |
 | Not listed | Fluids: lava lakes don't light through the list (a ray meets the lava's surface, with its `emission`) |
 | The grid | A convenience over the list with fixed choices; for others, read the list and build a grid of your own into a kept buffer in a compute or `[[before_world]]` pass |
-| When it changes | Rebuilt on the CPU when the camera moves on to another 16-block step or a light source is placed or removed |
+| When it changes | Rebuilt on a CPU worker when the camera moves on to another 16-block step, and at most every 100 ms when a light source is placed or removed; it reaches the passes a frame or two later, its positions still relative to the current camera |
 | Without the scene | The names are still there: `ray_light_count()` is 0 and `ray_lights_near` lists nothing |
 
 Block light that walls stop, from a post pass (`position` and `normal` as above). A full glowing block (glowstone)

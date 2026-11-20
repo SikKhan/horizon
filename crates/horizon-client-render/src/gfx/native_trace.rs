@@ -632,6 +632,11 @@ impl NativePost {
             .as_ref()
             .is_some_and(|t| t.rays.no_looks.is_some())
     }
+
+    /// Whether a pass built against the scene binds the light sources.
+    pub(in crate::gfx) fn traces_lights(&self) -> bool {
+        self.trace.as_ref().is_some_and(|t| t.rays.lights.is_some())
+    }
 }
 
 fn has_binding(module: &naga::Module, binding: u32) -> bool {
@@ -733,7 +738,7 @@ impl TerrainTrace {
             let join = |parity| {
                 let binds = Binds {
                     looks: self.traces_looks(),
-                    lights: self.rays.lights.is_some(),
+                    lights: self.traces_lights(),
                 };
                 let mut entries = self.rays.entries(scene, binds);
                 entries.extend(reads.map(|r| r.entries(parity)).unwrap_or_default());
@@ -761,6 +766,11 @@ impl TerrainTrace {
     /// Whether the terrain's rays read the terrain's looks.
     pub(in crate::gfx) fn traces_looks(&self) -> bool {
         self.rays.no_looks.is_some()
+    }
+
+    /// Whether the terrain's rays read the light sources.
+    pub(in crate::gfx) fn traces_lights(&self) -> bool {
+        self.rays.lights.is_some()
     }
 
     /// The pipelines and group 3 the terrain draws with this frame, if it traces, the kept
