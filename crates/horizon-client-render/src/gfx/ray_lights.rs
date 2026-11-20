@@ -234,7 +234,10 @@ impl RayLights {
                 None => Err(job),
             };
             match sent {
-                Ok(()) => (self.running, self.built) = (true, Some((origin, revision, now))),
+                // Stamped once sent: gathering or a worker's start doesn't count toward the wait.
+                Ok(()) => {
+                    (self.running, self.built) = (true, Some((origin, revision, Instant::now())));
+                }
                 // No worker, or it is gone: the request stays due, for the next one.
                 Err(mut job) => {
                     if self.worker.take().is_some() {
