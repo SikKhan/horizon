@@ -221,8 +221,9 @@ jobs:
       # Keys. The build folders: the shard's probe group, the toolchain and Cargo.lock, then the commit (restored from
       # the newest of the same group, toolchain and lock). The oracle results and parity state: their format, the
       # dataset, the JDK, the toolchain and the runner's folders (the oracle shim keys on absolute paths), then the
-      # group, the commit and the shard. The prepared resources: the preparer's key and the dataset. The plan job's
-      # values come from the tested tree: checked before they name anything.
+      # group, the commit and the shard (v2: the oracle shim's records since #18776 changed its key). The prepared
+      # resources: the preparer's key and the dataset. The plan job's values come from the tested tree: checked before
+      # they name anything.
       - name: Cache keys
         id: keys
         env:
@@ -271,8 +272,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SEALED }}/oracle
-          key: parity-oracle-v1-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}${{ github.sha }}-${{ matrix.shard }}
-          restore-keys: parity-oracle-v1-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}
+          key: parity-oracle-v2-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}${{ github.sha }}-${{ matrix.shard }}
+          restore-keys: parity-oracle-v2-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}
       # The passphrase's second step: an entry whose authentication tag fails is discarded with a warning (the run
       # goes on without it), never decrypted. What it holds goes to a stage, copied into place after the checkout.
       - name: Unseal the restored caches
@@ -472,7 +473,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SEALED }}/oracle
-          key: parity-oracle-v1-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}${{ github.sha }}-${{ matrix.shard }}
+          key: parity-oracle-v2-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}${{ github.sha }}-${{ matrix.shard }}
 
   # The job to read: it fails when hosted parity failed or did not run at all.
   result:
