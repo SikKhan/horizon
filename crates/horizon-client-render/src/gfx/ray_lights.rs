@@ -83,14 +83,20 @@ pub struct RayLights {
     worker: Option<Worker>,
     running: bool,
     spare: Job,
+    /// When a worker last failed to start (the next try waits `RESPAWN`), and whether that was
+    /// logged: the render thread never builds, so the buffer keeps what it holds meanwhile.
+    failed: Option<Instant>,
+    logged: bool,
     /// Counts the worlds: a rebuild for an earlier one is dropped when it comes back.
     epoch: u64,
     /// The world changed: the next frame empties the buffer's list and grid.
     blank: bool,
-    /// Builds on this thread where the worker couldn't start or is gone.
+    /// The light-giving block states, for a worker started again.
     table: Sources,
-    builder: Builder,
 }
+
+/// The least time between two tries to start a worker that failed to start.
+const RESPAWN: Duration = Duration::from_secs(1);
 
 /// A rebuild for the worker: the world it is for, the grid's corner, the camera, the
 /// light-giving blocks of the sections in its reach (`gather`), and the words to build into.
@@ -111,7 +117,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(table: Sources) -> Option<Self> {
+    fn spawn(table: Sources) -> std::io::Result<Self> {
         let (jobs, job_rx) = mpsc::channel::<Job>();
         let (done_tx, done) = mpsc::channel();
         std::thread::Builder::new()
@@ -126,9 +132,8 @@ impl Worker {
                         break;
                     }
                 }
-            })
-            .ok()?;
-        Some(Self { jobs, done })
+            })?;
+        Ok(Self { jobs, done })
     }
 }
 
@@ -149,17 +154,39 @@ impl RayLights {
             worker: None,
             running: false,
             spare: Job::default(),
+            failed: None,
+            logged: false,
             epoch: 0,
             blank: false,
             table: Sources::default(),
-            builder: Builder::default(),
         }
     }
 
     /// The light-giving block states, and the worker that builds from them.
     pub fn start(&mut self, table: Sources) {
-        self.worker = Worker::spawn(table.clone());
         self.table = table;
+        self.worker = None;
+        self.spawned(Instant::now());
+    }
+
+    /// The worker, started (again) if there is none, unless the last try failed under
+    /// `RESPAWN` ago.
+    fn spawned(&mut self, now: Instant) -> Option<&Worker> {
+        let waits = self
+            .failed
+            .is_some_and(|at| now.duration_since(at) < RESPAWN);
+        if self.worker.is_none() && !waits {
+            match Worker::spawn(self.table.clone()) {
+                Ok(w) => (self.worker, self.failed) = (Some(w), None),
+                Err(e) => {
+                    self.failed = Some(now);
+                    if !std::mem::replace(&mut self.logged, true) {
+                        log::warn!("Horizon: the ray light sources' worker doesn't start: {e}");
+                    }
+                }
+            }
+        }
+        self.worker.as_ref()
     }
 
     /// Every section is gone (a new world, a new dimension): the buffer is emptied next frame,
@@ -172,8 +199,9 @@ impl RayLights {
     /// Places the grid around `camera`. The sources and the cells are rebuilt, on the worker,
     /// when it moved on to another step, or when `revision` (of `sections`' sources) changed, at
     /// most every `SOURCE_REBUILDS` for that (a redstone clock would otherwise rebuild every
-    /// frame); a frame uploads them once they are built, a frame or two later. `min_y` is the
-    /// lowest block of the level's columns, which the sections' keys count from.
+    /// frame); a frame uploads them once they are built, a frame or two later. A worker gone is
+    /// started again and given the latest request; the render thread never builds. `min_y` is
+    /// the lowest block of the level's columns, which the sections' keys count from.
     pub fn update(
         &mut self,
         queue: &wgpu::Queue,
@@ -183,7 +211,7 @@ impl RayLights {
     ) {
         match self.worker.as_ref().map(|w| w.done.try_recv()) {
             Some(Ok(job)) => self.landed(queue, job),
-            // The worker is gone: its rebuild never lands, and this thread builds from now on.
+            // The worker is gone, and its rebuild with it: asked again of the next one.
             Some(Err(TryRecvError::Disconnected)) => {
                 self.worker = None;
                 if std::mem::take(&mut self.running) {
@@ -198,20 +226,23 @@ impl RayLights {
         }
         let (origin, now) = (grid_origin(camera), Instant::now());
         if !self.running && due(self.built, origin, revision, now) {
-            self.built = Some((origin, revision, now));
             let mut job = std::mem::take(&mut self.spare);
             (job.epoch, job.origin, job.camera) = (self.epoch, origin, camera);
             gather(origin, min_y, sections, &mut job.blocks);
-            match &self.worker {
-                Some(w) => match w.jobs.send(job) {
-                    Ok(()) => self.running = true,
-                    // The worker is gone: build here from now on.
-                    Err(mpsc::SendError(job)) => {
-                        self.worker = None;
-                        self.build_here(queue, job);
+            let sent = match self.spawned(now) {
+                Some(w) => w.jobs.send(job).map_err(|mpsc::SendError(job)| job),
+                None => Err(job),
+            };
+            match sent {
+                Ok(()) => (self.running, self.built) = (true, Some((origin, revision, now))),
+                // No worker, or it is gone: the request stays due, for the next one.
+                Err(mut job) => {
+                    if self.worker.take().is_some() {
+                        self.failed = None;
                     }
-                },
-                None => self.build_here(queue, job),
+                    job.blocks.clear();
+                    self.spare = job;
+                }
             }
         }
         // Against the corner of the words the buffer holds, which only an upload moves.
@@ -229,12 +260,6 @@ impl RayLights {
             true => self.upload(queue, job),
             false => self.spare = job,
         }
-    }
-
-    fn build_here(&mut self, queue: &wgpu::Queue, mut job: Job) {
-        self.builder.build(&self.table, &mut job);
-        job.blocks.clear();
-        self.upload(queue, job);
     }
 
     /// Uploads the built `job`'s words: the header and its sources, then every cell's count
@@ -784,10 +809,10 @@ mod tests {
         assert_eq!(lights.spare.words[0], 0);
     }
 
-    /// A worker gone with a rebuild under way: the rebuild is asked again, and built on this
-    /// thread from then on.
+    /// A worker gone with a rebuild under way, and one gone before a rebuild is sent to it: each
+    /// time a new worker is started and given the latest request; this thread builds nothing.
     #[test]
-    fn a_lost_worker_s_rebuild_is_built_here() {
+    fn a_lost_worker_s_rebuild_is_built_on_a_new_one() {
         let Some((_, device, queue)) = crate::gfx::test_gpu::optional_device() else {
             return;
         };
@@ -796,15 +821,28 @@ mod tests {
         let sections = sections(&[([2, 64, 0], 1)]);
         let mut lights = RayLights::new(&device);
         lights.table = table;
+        let camera = DVec3::new(0.5, 64.5, 0.5);
+        // Gone with its rebuild: nothing comes back.
         let (jobs, _job_rx) = mpsc::channel();
         let (_, done) = mpsc::channel();
         lights.worker = Some(Worker { jobs, done });
-        let camera = DVec3::new(0.5, 64.5, 0.5);
         (lights.running, lights.built) = (true, Some((grid_origin(camera), 1, Instant::now())));
         lights.update(&queue, camera, (&sections, MIN_Y), 1);
-        assert!(lights.worker.is_none() && !lights.running);
+        assert!(lights.worker.is_some() && lights.running && lights.shown.is_none());
+        lights.settle(&queue);
         assert_eq!(lights.shown, Some(grid_origin(camera)));
         assert_eq!(lights.spare.words[0], 1);
+        // Gone before the next rebuild is sent: it stays due, for the worker started next frame.
+        let (jobs, _) = mpsc::channel();
+        let (_done_tx, done) = mpsc::channel();
+        lights.worker = Some(Worker { jobs, done });
+        let stepped = camera + DVec3::X * 16.0;
+        lights.update(&queue, stepped, (&sections, MIN_Y), 1);
+        assert!(lights.worker.is_none() && !lights.running);
+        lights.update(&queue, stepped, (&sections, MIN_Y), 1);
+        assert!(lights.running);
+        lights.settle(&queue);
+        assert_eq!(lights.shown, Some(grid_origin(stepped)));
     }
 
     /// Sections keyed from a level's own lowest block (below vanilla's): the sources deep in it
