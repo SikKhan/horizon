@@ -861,7 +861,6 @@ fn a_traced_pack_s_own_hit_helper_is_refused_as_its_own_trace_is() {
         "trace_layers",
         "RAY_TRANSLUCENT",
         "RAY_ENTITY",
-        "ray_lights_near",
         "hit_normal_map",
         "block_pbr_maps",
     ];
@@ -1174,23 +1173,105 @@ const LIT: &str = "fn post(input: PostInput) -> vec4<f32> {
 }
 ";
 
-/// The light sources are only a pack's whose files name a light function: its post pass is
-/// checked without the scene and with it (each translated to SPIR-V, HLSL and Metal) and binds
-/// their buffer against the scene; another traced pack's binds none.
+/// `[ray_tracing]` with the light sources (`lights = true`).
+fn lit(post: &str) -> Result<horizon_shader_api::Report, Vec<Problem>> {
+    post_pack(post, TONEMAP, "[ray_tracing]\nlights = true\n")
+}
+
+/// With `lights = true` a post pass that names the light functions is checked without the scene
+/// and with it (each translated to SPIR-V, HLSL and Metal) and binds their buffer against the
+/// scene; one that names none, or only in a comment, binds none. Without the key the names are
+/// unknown, and the check says which key brings them.
 #[test]
-fn the_light_sources_are_the_pack_s_that_names_them() {
-    let report = traced(LIT).unwrap();
+fn the_light_sources_are_the_keyed_pack_s_that_names_them() {
+    let report = lit(LIT).unwrap();
     let post = &report.stages[0];
     assert!(post.traces_lights());
     let plain = naga::valid::Capabilities::default();
     assert!(!ray_queries(&post.module) && valid(&post.module, plain));
     let scene = post.scene.as_ref().unwrap();
     assert!(valid(scene, plain | naga::valid::Capabilities::RAY_QUERY));
-    assert!(!traced(SHADOWED).unwrap().stages[0].traces_lights());
+    assert!(!lit(SHADOWED).unwrap().stages[0].traces_lights());
     let commented = format!("// ray_lights_near\n{SHADOWED}");
-    assert!(!traced(&commented).unwrap().stages[0].traces_lights());
-    // Without `[ray_tracing]` there are no light functions.
-    assert!(post_pack(LIT, TONEMAP, "").is_err());
+    assert!(!lit(&commented).unwrap().stages[0].traces_lights());
+    for unkeyed in [traced(LIT), post_pack(LIT, TONEMAP, "")] {
+        let problems: Vec<String> = unkeyed
+            .unwrap_err()
+            .iter()
+            .map(Problem::to_string)
+            .collect();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("`lights = true` under `[ray_tracing]`")),
+            "{problems:#?}"
+        );
+    }
+}
+
+/// A light function of the pack's own (`ray_light` in the post pass and in a material stage
+/// that traces nothing) stays the pack's without `lights = true`: the pack checks, its material
+/// isn't built against the scene, and every stage composes byte for byte as the same pack with
+/// the helper named otherwise, with the scene and without it. With the key the name is taken.
+#[test]
+fn a_pack_s_own_ray_light_stays_its_own_without_the_key() {
+    let helper = "fn ray_light(c: vec4<f32>) -> vec4<f32> { return c * 0.5; }\n";
+    let post = format!(
+        "{helper}{}",
+        SHADOWED
+            .replace("return vec4<f32>(", "return ray_light(vec4<f32>(")
+            .replace(
+                "f32(hit.material + hit.tags));",
+                "f32(hit.material + hit.tags)));"
+            )
+    );
+    let material = format!(
+        "{helper}fn material(input: MaterialInput) -> Surface {{ return Surface(ray_light(input.albedo)); }}\n"
+    );
+    let pack = |name: &str, keys: &str| {
+        let manifest = format!(
+            "schema = 1\nid = \"p\"\nname = \"P\"\nversion = \"1\"\napi = \"0.2\"\n\
+             [material]\nfile = \"material.wgsl\"\n[[post]]\nfile = \"post.wgsl\"\n\
+             [tonemap]\nfile = \"tonemap.wgsl\"\n[ray_tracing]\n{keys}"
+        );
+        let files = [
+            (MANIFEST, manifest),
+            ("material.wgsl", material.replace("ray_light", name)),
+            ("post.wgsl", post.replace("ray_light", name)),
+            ("tonemap.wgsl", TONEMAP.to_owned()),
+        ]
+        .map(|(n, t)| (n.to_owned(), t.into_bytes()))
+        .into();
+        Pack::from_files(files).unwrap()
+    };
+    let (own, other) = (pack("ray_light", ""), pack("pack_light", ""));
+    let report = check(&own).unwrap();
+    let material_stage = report.stages.iter().find(|s| s.kind == StageKind::Material);
+    assert!(material_stage.unwrap().scene.is_none());
+    assert!(report.stages.iter().all(|s| !s.traces_lights()));
+    for (kind, file) in [
+        (StageKind::Post, "post.wgsl"),
+        (StageKind::Material, "material.wgsl"),
+    ] {
+        use horizon_shader_api::{compose, compose_scene};
+        for build in [compose, compose_scene] {
+            let renamed = build(&other, kind, file)
+                .text
+                .replace("pack_light", "ray_light");
+            assert_eq!(build(&own, kind, file).text, renamed, "{kind:?}");
+        }
+    }
+    let problems: Vec<String> = check(&pack("ray_light", "lights = true\n"))
+        .unwrap_err()
+        .iter()
+        .map(Problem::to_string)
+        .collect();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("redefinition of `ray_light`")),
+        "{problems:#?}"
+    );
 }
 
 /// Pin the post and material WGSL of a pack that reads `hit.tint` and `hit.emission` and leaves

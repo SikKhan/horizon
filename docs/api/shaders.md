@@ -241,7 +241,8 @@ blend = "gamma"            # optional: gamma (default) or linear
 primaries = "bt709"        # optional: bt709 (default) or bt2020, which needs blend = "linear"
 fog = "engine"             # optional: engine (default) or pack, when the pack fogs what its stages draw
 
-[ray_tracing]              # optional, needs [[post]] or [material], no keys: the post stage gets `trace` and `trace_any`, the material stage where it calls them
+[ray_tracing]              # optional, needs [[post]] or [material]: the post stage gets `trace` and `trace_any`, the material stage where it calls them
+lights = true              # optional, default false: the light sources (`ray_lights_near`, `ray_light`) in the stages that name them
 [motion]                   # optional, needs [[post]]: the post stage's motion guide (not drawn yet)
 ```
 
@@ -297,6 +298,12 @@ no shadow into a pack's shadow map yet, and the first-person hand has no stage.
 
 ## Changelog
 
+- 2026-11-20: API 0.2 (additions, preview): the light sources, under `[ray_tracing]` with its first key,
+  `lights = true` (off by default). A stage whose files name `ray_lights_near`, `ray_light`, `ray_light_at`,
+  `ray_light_count` or `RayLight` gets the light-giving blocks around the camera (`RayLight`: `position`, `level`,
+  `color`, `material`; up to 1024, nearest first; fluids left out) and a grid of 8-block cells listing the sources that
+  reach each, so a pass aims shadow rays at a few sources ([the guide](../shaders.md#light-sources)); only such a pass
+  binds them (binding 80). A pack without the key sees the same prelude as before, and its own names stay its own.
 - 2026-11-19: API 0.2 (change, preview): under a pack without `[[post]]` whose frame holds gamma light and whose
   `[tonemap]`, if it has one, never reads `previous`, TAA upscaling and its sharpening apply too (#16126 step 7): the
   world draws smaller, `frame.resolution` stays its size, `input.color` samples the picture TAA rebuilt, and the
@@ -374,11 +381,6 @@ no shadow into a pack's shadow map yet, and the first-person hand has no stage.
   refuses `x` of a texture only `[[post]]` passes write, and `writes` on either stage. An entity or sky stage without
   `reads` composes and draws as before, a test holds. The reference now says that a compute pass may call
   `storageBarrier()`.
-- 2026-11-15: API 0.2 (additions, experimental): the light sources under `[ray_tracing]`. A pack whose files name
-  `ray_lights_near`, `ray_light`, `ray_light_at`, `ray_light_count` or `RayLight` gets the light-giving blocks around
-  the camera (`RayLight`: position, level, colour, block state; up to 1024, nearest first) and a grid of 8-block cells
-  listing the sources that reach each, so a pass aims shadow rays at a few sources
-  ([the guide](../shaders.md#light-sources)). Other packs are unchanged.
 - 2026-11-15: API 0.2 (additions, experimental): `[material] reads` (#16011 item 4): the terrain reads kept
   resources, `x` for this frame's version of a texture a `[[before_world]]` pass writes (in the same frame),
   `x_previous` for last frame's, and buffers; their declarations join the material's module at the passes'

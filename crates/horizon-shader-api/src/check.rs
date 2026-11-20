@@ -99,8 +99,9 @@ impl CheckedStage {
         })
     }
 
-    /// Whether the stage against the scene reads the light sources: its pack's files name them
-    /// (`names_ray_lights`), so the renderer keeps and binds their list for it.
+    /// Whether the stage against the scene reads the light sources: its own files name them
+    /// (`[ray_tracing] lights = true`, `names_ray_lights`), so the renderer binds their list in
+    /// this pass's layout (binding 80) and keeps it for the pack.
     pub fn traces_lights(&self) -> bool {
         self.scene.as_ref().is_some_and(|module| {
             module.global_variables.iter().any(|(_, g)| {
@@ -889,6 +890,12 @@ fn parse(composed: &Composed) -> Result<naga::Module, Vec<Problem>> {
         let mut message = e.message().to_owned();
         if let Some((_, text)) = label.filter(|(_, t)| !t.is_empty() && !message.contains(*t)) {
             message += &format!(" ({text})");
+        }
+        // A light function named without the key, or outside the stages that trace.
+        let light = |n: &&str| message.contains(&format!("`{n}`"));
+        if crate::stages::LIGHT_NAMES.iter().any(light) {
+            message += "; the light sources are only in the post, compute, `[[before_world]]` \
+                        and material stages of a pack with `lights = true` under `[ray_tracing]`";
         }
         let at = label.and_then(|(span, _)| span.to_range()).map(|r| r.start);
         vec![located(composed, at, message)]

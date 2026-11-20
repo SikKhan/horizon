@@ -183,6 +183,18 @@ pub(super) fn pack(
     manifest: &str,
     files: &[(&str, &str)],
 ) -> NativePack {
+    pack_with(device, queue, scene, manifest, files, Default::default())
+}
+
+/// `pack` with the light sources `sources` (`ray_lights::source`).
+fn pack_with(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &Scene,
+    manifest: &str,
+    files: &[(&str, &str)],
+    sources: crate::gfx::ray_lights::Sources,
+) -> NativePack {
     let manifest = format!("{HEAD}{manifest}[tonemap]\nfile = \"t.wgsl\"\n");
     let mut all: std::collections::BTreeMap<String, Vec<u8>> = (files.iter())
         .chain(&[("t.wgsl", IDENTITY)])
@@ -195,8 +207,15 @@ pub(super) fn pack(
         sprite_views: &scene.sprites,
         ..crate::gfx::native_pack::tests::terrain_shape(&globals, &empty)
     };
-    let (mut pack, _) =
-        NativePack::new(device, queue, &terrain, report, &[], Default::default()).unwrap();
+    let (mut pack, _) = NativePack::new(
+        device,
+        queue,
+        &terrain,
+        report,
+        &[],
+        (Default::default(), sources),
+    )
+    .unwrap();
     install(device, Some(&mut pack.post), None, [1, 1]).unwrap();
     pack
 }
@@ -896,4 +915,63 @@ fn a_pass_that_skips_hit_looks_keeps_its_storage_buffer_budget() {
         shows(got, [0.5, 1.0, (64.0_f32 / 255.0).powf(2.2)]),
         "{got:?}"
     );
+}
+
+/// Under `[ray_tracing] lights = true`, a `[[before_world]]` pass and a compute `[[post]]` pass
+/// read a torch through the light functions (its level and material, and its cell's list), and
+/// a fragment post pass of the same pack that names none of them traces with exactly the 8
+/// storage buffers the device takes: it has no binding 80, or its rays would miss.
+#[test]
+fn only_the_passes_that_name_the_light_sources_bind_them() {
+    let Some((_, device, queue)) = ray_device_with_storage_limit(8) else {
+        return;
+    };
+    let mut manifest = HIT.replace("[ray_tracing]\n", "[ray_tracing]\nlights = true\n");
+    for i in 1..=5 {
+        manifest += &format!(
+            "[[resource]]\nname = \"b{i}\"\nbuffer = 16\nelement = \"f32\"\nkeep = \"view\"\n"
+        );
+    }
+    manifest += "[[before_world]]\nfile = \"w.wgsl\"\ndispatch = [1, 1, 1]\nworkgroup = [1, 1, 1]\n\
+                 writes = [\"hit\"]\n[[post]]\nfile = \"c.wgsl\"\ncompute = true\n\
+                 dispatch = [1, 1, 1]\nworkgroup = [1, 1, 1]\nwrites = [\"hit\"]\n[[post]]\n\
+                 file = \"l.wgsl\"\nreads = [\"hit\", \"b1\", \"b2\", \"b3\", \"b4\", \"b5\"]\n";
+    let level = "fn compute(input: ComputeInput) {\n    \
+                 let l = ray_light(0u);\n    \
+                 hit[1] = l.level + f32(l.material) * f32(ray_light_count());\n}\n";
+    let near = "fn compute(input: ComputeInput) {\n    \
+                hit[2] = f32(ray_lights_near(ray_light(0u).position).y);\n}\n";
+    // Red the pass's own hit's distance / 8, green `has_ray_tracing`, blue the light passes'.
+    let show = "fn post(input: PostInput) -> vec4<f32> {\n    \
+                let d = trace(vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), 64.0).distance;\n    \
+                let kept = b1[0] + b2[0] + b3[0] + b4[0] + b5[0];\n    \
+                let lights = (hit[1] + hit[2]) / 32.0 + kept;\n    \
+                return vec4<f32>(d / 8.0, f32(frame.has_ray_tracing), lights, 1.0);\n}\n";
+    let mut sources = crate::gfx::ray_lights::Sources::default();
+    let torch = crate::gfx::ray_lights::Source {
+        color: [1.0; 3],
+        level: 14,
+        material: 3,
+    };
+    sources.insert(1, torch);
+    let scene = Scene::new(&device, &queue, 4.0, 1);
+    let world = World::new(&device);
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let files = [("w.wgsl", level), ("c.wgsl", near), ("l.wgsl", show)];
+    let mut pack = pack_with(&device, &queue, &scene, &manifest, &files, sources);
+    let camera = glam::DVec3::new(0.5, 64.5, 0.5);
+    let key = (0, (64 - crate::chunk::MIN_Y) / 16, 0);
+    let sections = [(key, vec![([2, 64, 0], 1)])].into_iter().collect();
+    let lights = pack.frame.ray_lights.as_mut().expect("the light sources");
+    lights.update(&queue, camera, &sections, 1);
+    let got = frame(
+        (&device, &queue, &world),
+        &mut pack,
+        1,
+        Some(&scene.traced()),
+    );
+    // Level 14 plus material 3 of the one source, and the one source its cell lists.
+    assert!(shows(got, [0.5, 1.0, 18.0 / 32.0]), "{got:?}");
+    let error = pollster::block_on(scope.pop());
+    assert!(error.is_none(), "{error:?}");
 }

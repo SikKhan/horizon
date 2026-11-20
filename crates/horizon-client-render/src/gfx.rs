@@ -6704,9 +6704,8 @@ impl Renderer {
             Vec<(String, f64)>,
             Vec<(u32, u32)>,
             Vec<(u32, u32)>,
-            // The `[[lights]]` colours, and every light source for rays that aim at them
-            // (`NativePack::new`).
-            (block_light::LightTable, block_light::LightTable),
+            // The `[[lights]]` colours, and the light sources rays read (`NativePack::new`).
+            (block_light::LightTable, ray_lights::Sources),
         )>,
     ) -> std::result::Result<Vec<String>, String> {
         self.world_held = false;

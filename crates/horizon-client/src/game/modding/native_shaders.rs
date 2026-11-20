@@ -272,14 +272,26 @@ impl Game<'_> {
                     }
                 }
             }
-            // Every light-giving block state, for a pack whose rays aim at light sources: its
-            // `[[lights]]` colour, white where it has none.
-            let mut sources = horizon_client::gfx::block_light::LightTable::default();
+            // Each light source a `[ray_tracing] lights = true` pack's rays read: its
+            // `[[lights]]` colour, its level and its model's `[[materials]]` id (lava left out).
+            let mut sources = horizon_client::gfx::ray_lights::Sources::default();
             if horizon_shader_api::stages::names_ray_lights(&pack) {
+                let catalog = &self.pack.render.model_catalog;
+                let origin = horizon_core::position::BlockPos::new(0, 0, 0);
                 for (id, state) in self.res.facts().states.iter().enumerate() {
-                    if state.emission > 0 {
-                        let color = pack.manifest.light_of(&state.name).unwrap_or([1.0; 3]);
-                        sources.insert(id as u32, (color, state.emission));
+                    if state.emission == 0 {
+                        continue;
+                    }
+                    let state_id = horizon_world::registry::BlockStateId(id as u32);
+                    let models = catalog.collect(state_id, origin).unwrap_or_default();
+                    let layers = models
+                        .iter()
+                        .flat_map(|(_, m)| m.faces.iter().map(|f| f.layer));
+                    let color = pack.manifest.light_of(&state.name);
+                    let light = (state.emission, state.fluid);
+                    let source = horizon_client::gfx::ray_lights::source;
+                    if let Some(s) = source(light, color, layers, &materials) {
+                        sources.insert(id as u32, s);
                     }
                 }
             }

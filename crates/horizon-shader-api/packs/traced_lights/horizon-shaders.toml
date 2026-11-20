@@ -8,6 +8,7 @@ authors = ["Horizon"]
 license = "MIT"
 
 [ray_tracing]
+lights = true
 
 [[post]]
 file = "post.wgsl"

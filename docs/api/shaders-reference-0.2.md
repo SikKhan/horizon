@@ -348,10 +348,10 @@ pass reads a blank one in place of the target it writes).
 
 ### Ray tracing
 
-With `[ray_tracing]` in the manifest (it has no keys, and needs a `[[post]]` pass, a `[[before_world]]` pass or a
-`[material]` stage) the post stage's prelude also has `RayHit` and the functions and constants below, so do the
-material, compute and `[[before_world]]` stages' where their files name one of the four trace functions (or a
-light function, below), and the
+With `[ray_tracing]` in the manifest (it needs a `[[post]]` pass, a `[[before_world]]` pass or a `[material]`
+stage; its one key, `lights`, is below) the post stage's prelude also has `RayHit` and the functions and constants
+below, so do the material, compute and `[[before_world]]` stages' where their files name one of the four trace
+functions (or, with `lights = true`, a light one), and the
 `Frame` of every stage of the pack has `has_ray_tracing` and `ray_distance`. A pack without the key has none of
 them, and a material, compute or `[[before_world]]` stage that names no trace function is built as without it.
 
@@ -386,14 +386,26 @@ asks for ray queries and keeps the scene with any pack or none; any other value 
   and `block_specular_map_level(uv, 0.0)` read a drawn surface's; their defaults without maps, and on a miss.
 - In the post, compute and `[[before_world]]` stages, `fn block_pbr_maps() -> bool`: whether the resource packs
   ship LabPBR maps, as the material stage's.
-- The light sources, only in a pack whose files name one of these five, outside a comment: `struct RayLight`
-  (`position`, the centre of its block, camera-relative; `level`, its light level 1 to 15; `color`, its `[[lights]]`
-  colour, white for a block the pack gives none; `state`, its block state), `fn ray_light_count() -> u32` and
-  `fn ray_light(i: u32) -> RayLight`: every block that gives off light within the grid, the nearest the camera first,
-  at most 1024; `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources that reach a camera-relative
-  point, as the first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads (the grid's cells are 8
-  blocks, 16 a side around the camera, each listing at most 24, the strongest there first; none outside it). The
-  list only says where sources are: trace towards one (`trace_any`) to know whether its light gets through.
+- The light sources, only with `lights = true` under `[ray_tracing]` (off by default: without it these five names
+  are free for the pack's own), and only in a stage whose files name one of them outside a comment, which alone
+  binds them. `struct RayLight`: `position: vec3<f32>`, the centre of its block, camera-relative from the player's
+  camera (`frame.camera_position`) in every pass, as `trace`'s `origin` and `view_position` are; `level: f32`,
+  vanilla's light level of the block, 1 to 15 (a terrain hit's `RayHit.emission` times 15); `color: vec3<f32>`,
+  its `[[lights]]` colour decoded to linear as `block_light_color`'s is, white for a block the pack gives none;
+  `material: u32`, its `[[materials]]` id, the one `RayHit.material` reports on the first face of its model whose
+  sprite has one, 0 where none does. `fn ray_light_count() -> u32` and `fn ray_light(i: u32) -> RayLight`: the
+  blocks that give off light in the grid or within 15 blocks of it, the nearest the camera first, at most 1024.
+  Fluids are left out: lava is not listed, so lava lakes don't light through `ray_lights_near` (they would fill
+  every cell nearby and push the torches out; a ray meets the lava's surface anyway, with its `emission`).
+  `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources that reach a camera-relative point, as the
+  first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads; none outside the grid. The list is
+  the data, and the grid a convenience built from it with fixed choices (8-block cells, 16 a side around the
+  camera, at most 24 a cell, ranked by vanilla's falloff, level minus distance, at the cell's nearest point): a
+  pack that wants others reads the list and builds its own grid into a kept buffer in a compute or
+  `[[before_world]]` pass. The list only says where sources are: trace towards one (`trace_any`) to know whether
+  its light gets through. A full glowing cube (glowstone, a sea lantern) is in the scene itself, so a ray aimed
+  at its centre is stopped by the source: end the ray where it enters the source's block (as
+  `packs/traced_lights` does), or take a hit within the block as the source.
 
 A ray starts at `origin` itself, so move a point off its own surface before tracing from it. What stops it is what
 the surface's own pass draws. In the solid layer it passes through the clear texels of a cut-out texture (leaves,
@@ -447,8 +459,8 @@ The nearest surface along a ray, from `trace` or `trace_layers`. Its `albedo`, `
 | `shaded_tint` | `vec4<f32>` | Only in a pack whose files name `shaded_tint`: the colour vanilla multiplies the texture by with the face's shade and ambient occlusion in it, `tint.rgb * shade * ao` as vanilla's vertex carries it (vanilla multiplies them at each corner in 8-bit integers, so it is within two steps of 255 of that product); alpha 1. Draw vanilla's colour with it; `tint`, `shade` and `ao` are for lighting faces yourself, and reading them from `MaterialInput` or `VertexInput` makes the world load again when the pack starts and terrain take a third again its memory. For the cost of reading those fields on a terrain hit, see `RayHit`. On `RayHit` it is linear light. Terrain hits interpolate the baked vertex colour, entity hits use `tint.rgb * shade` and keep their `tint`'s alpha, and misses return 0. |
 
 Bindings 48 to 59 of group 3 hold the scene while the game traces (60 to
-63 the entity layer, for a pack that names it, 80 the light sources, for a pack that
-names them), and in a post, compute or `[[before_world]]` pass bindings
+63 the entity layer, for a pack that names it, 80 the light sources, for a pass that
+names them under `lights = true`), and in a post, compute or `[[before_world]]` pass bindings
 12 and 13 the LabPBR maps (the material stage has them there already).
 Binding 81 holds terrain hit looks for a stage that reads `RayHit.tint`, `shade` or `ao` from its entry point.
 These bindings are Horizon's, as their `horizon_` names say, and change with the renderer.

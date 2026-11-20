@@ -1,11 +1,24 @@
-// Light from the blocks that give it off (torches, lanterns, glowstone, lava), each source tested
-// with a ray, so walls stop it and corners cast shadows. It adds to the picture, whose own block
+// Light from the blocks that give it off (torches, lanterns, glowstone; not lava, which isn't
+// listed), each source tested with a ray, so walls stop it and corners cast shadows. It adds to the picture, whose own block
 // light stays: it shows how the light sources are read, not how block light should look.
 
 // How bright a source's light is at its block, over the picture's own colour.
 const GAIN: f32 = 1.5;
 // The most sources a pixel tests, of those its cell lists (the strongest there first).
 const MOST: u32 = 8u;
+
+// How far along the unit `direction` from `origin` the ray enters the block whose centre is
+// `center`: a full glowing cube (glowstone, a sea lantern) is in the ray scene itself, so a
+// shadow ray aimed at its centre would be stopped by the source.
+fn block_entry(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>) -> f32 {
+    // An axis the ray runs along never limits it: a tiny step instead of a division by 0.
+    let tiny = vec3<f32>(1e-6);
+    let inverse = 1.0 / select(direction, tiny, abs(direction) < tiny);
+    let a = (center - 0.5 - origin) * inverse;
+    let b = (center + 0.5 - origin) * inverse;
+    let near = min(a, b);
+    return max(max(near.x, near.y), near.z);
+}
 
 // The face a pixel's point lies on, from its neighbours' points, turned toward the camera.
 fn surface_normal(uv: vec2<f32>, position: vec3<f32>) -> vec3<f32> {
@@ -44,8 +57,9 @@ fn post(input: PostInput) -> vec4<f32> {
         if facing <= 0.0 {
             continue;
         }
-        // The ray stops short of the source's own block, which may be a solid one (glowstone).
-        if trace_any(origin, direction, max(distance - 0.6, 0.0)) {
+        // The ray stops just short of the source's own block, which may be a solid one.
+        let reach = block_entry(origin, direction, source.position) - 0.01;
+        if reach > 0.0 && trace_any(origin, direction, reach) {
             continue;
         }
         // As block light falls off: strongest at the source, gone at its level.

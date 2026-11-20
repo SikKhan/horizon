@@ -260,7 +260,7 @@ and the check refuses a pack that names one itself.
 
 | | |
 | --- | --- |
-| In the scene today | Terrain within 8 chunks of the camera, in two layers: solid terrain (cut-outs and lava included), which `trace` reads, and translucent terrain (water, stained glass, ice), which [`trace_layers`](#layers) reads; `frame.ray_distance` is how far it surely reaches. For a pack that names `RAY_ENTITY`, a third layer: [the entities within that reach](#entities), in view or not. For a pack that names the light functions, [the light sources around the camera](#light-sources) |
+| In the scene today | Terrain within 8 chunks of the camera, in two layers: solid terrain (cut-outs and lava included), which `trace` reads, and translucent terrain (water, stained glass, ice), which [`trace_layers`](#layers) reads; `frame.ray_distance` is how far it surely reaches. For a pack that names `RAY_ENTITY`, a third layer: [the entities within that reach](#entities), in view or not. For a pack with `lights = true` under `[ray_tracing]`, [the light sources around the camera](#light-sources) |
 | Not in it yet | Block entities at rest (a closed chest) or out of view, the hand, distant terrain tiles |
 | Turning it on | Pick the pack and start the game with it, on a GPU and graphics API with hardware ray queries: the device needs them from its creation, so in a game started without them a pack picked while it runs traces from the next start, and the shader pack screen says so. `HORIZON_RAY_TRACING=1` asks for ray queries and keeps the scene with any pack or none; any other value of it turns ray tracing off |
 | Without it | The pack loads and runs as it is: `frame.has_ray_tracing` is 0, `trace` misses and `trace_any` is false. Branch on `has_ray_tracing` and keep a look that works without rays. It is also 0 in a pack none of whose stages calls a trace function |
@@ -343,32 +343,45 @@ let shadowed = trace_any_layers(position + normal * 0.01, frame.sun_direction, 6
 
 #### Light sources
 
-A pack whose files name `ray_lights_near`, `ray_light`, `ray_light_at`, `ray_light_count` or `RayLight` (outside a
-comment) also gets the light sources around the camera: the blocks that give off light, up to 1024 of them nearest
-the camera first, and a grid of 8-block cells 128 blocks across over them, each listing the sources whose light reaches
-it (at most 24, the strongest there first). A pass then aims shadow rays at the few sources its cell lists instead of
-every source in the world. Every other pack is built and runs as without them.
+With `lights = true` under `[ray_tracing]`, a stage whose files name `ray_lights_near`, `ray_light`, `ray_light_at`,
+`ray_light_count` or `RayLight` (outside a comment) also gets the light sources around the camera: the blocks that
+give off light, up to 1024 of them nearest the camera first, and a grid of 8-block cells 128 blocks across over them,
+each listing the sources whose light reaches it (at most 24, the strongest there first). A pass then aims shadow rays
+at the few sources its cell lists instead of every source in the world. Without the key the five names are the pack's
+own, and a pass that doesn't name them doesn't bind them (one storage buffer fewer).
 
 | | |
 | --- | --- |
-| A source | `RayLight`: `position`, its block's centre, camera-relative; `level`, the block's light level (1 to 15); `color`, its `[[lights]]` colour, white for a block the pack gives none; `state`, its block state |
+| A source | `RayLight`: `position`, its block's centre, camera-relative to the player's camera as `trace` takes it; `level`, vanilla's light level of the block (1 to 15); `color`, its `[[lights]]` colour, linear as `block_light_color`'s, white for a block the pack gives none; `material`, its `[[materials]]` id as `RayHit.material` reports it, 0 for none |
 | `ray_lights_near(position)` | The sources that reach the camera-relative `position`, as `vec2<u32>(first, count)` of indices to read with `ray_light_at`; none outside the grid |
 | `ray_light(i)`, `ray_light_count()` | The source `i` of the whole list, below `ray_light_count()` (level 0 past it) |
+| Not listed | Fluids: lava lakes don't light through the list (a ray meets the lava's surface, with its `emission`) |
+| The grid | A convenience over the list with fixed choices; for others, read the list and build a grid of your own into a kept buffer in a compute or `[[before_world]]` pass |
 | When it changes | Rebuilt on the CPU when the camera moves on to another 16-block step or a light source is placed or removed |
 | Without the scene | The names are still there: `ray_light_count()` is 0 and `ray_lights_near` lists nothing |
 
-Block light that walls stop, from a post pass (`position` and `normal` as above):
+Block light that walls stop, from a post pass (`position` and `normal` as above). A full glowing block (glowstone)
+is in the scene itself, so the ray ends where it enters the source's block, or it would hit the source:
 
 ```wgsl
+// How far along `direction` the ray from `origin` enters the block centred on `center`.
+fn block_entry(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>) -> f32 {
+    let tiny = vec3<f32>(1e-6);
+    let inverse = 1.0 / select(direction, tiny, abs(direction) < tiny);
+    let near = min((center - 0.5 - origin) * inverse, (center + 0.5 - origin) * inverse);
+    return max(max(near.x, near.y), near.z);
+}
+
+let origin = position + normal * 0.02;
 let near = ray_lights_near(position);
 var light = vec3<f32>(0.0);
 for (var i = 0u; i < near.y; i++) {
     let source = ray_light(ray_light_at(near.x + i));
-    let to = source.position - position;
+    let to = source.position - origin;
     let d = length(to);
     let falloff = max(1.0 - d / source.level, 0.0);
-    // End the ray before the source's own block.
-    if falloff > 0.0 && !trace_any(position + normal * 0.01, to / d, max(d - 0.6, 0.0)) {
+    let reach = block_entry(origin, to / d, source.position) - 0.01;
+    if falloff > 0.0 && (reach <= 0.0 || !trace_any(origin, to / d, reach)) {
         light += source.color * falloff * falloff * max(dot(normal, to / d), 0.0);
     }
 }
