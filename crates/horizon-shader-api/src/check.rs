@@ -606,18 +606,22 @@ fn check_entry(
             let capabilities = Capabilities::default() | Capabilities::RAY_QUERY;
             let info = validate(&module, &composed, capabilities)?;
             if kind == StageKind::Material {
-                let what = "a trace function: it runs in a vertex shader, and only `material` \
-                            traces rays";
                 // The scene's bindings, the entity layer's last, and the light sources'.
-                let problems: Vec<_> = [
-                    RAY_SCENE_BINDING..=RAY_ENTITY_RETAINED_BINDING,
-                    RAY_LIGHTS_BINDING..=RAY_LIGHTS_BINDING,
-                ]
-                .into_iter()
-                .flat_map(|bindings| {
-                    vertex_reach(&module, &info, &composed, &pack.manifest, (bindings, what))
-                })
-                .collect();
+                let reached = [
+                    (
+                        RAY_SCENE_BINDING..=RAY_ENTITY_RETAINED_BINDING,
+                        "a trace function: it runs in a vertex shader, and only `material` \
+                         traces rays",
+                    ),
+                    (
+                        RAY_LIGHTS_BINDING..=RAY_LIGHTS_BINDING,
+                        "the light sources: it runs in a vertex shader, and only `material` \
+                         reads them",
+                    ),
+                ];
+                let problems: Vec<_> = (reached.into_iter())
+                    .flat_map(|r| vertex_reach(&module, &info, &composed, &pack.manifest, r))
+                    .collect();
                 if !problems.is_empty() {
                     return Err(problems);
                 }
@@ -891,8 +895,9 @@ fn parse(composed: &Composed) -> Result<naga::Module, Vec<Problem>> {
         if let Some((_, text)) = label.filter(|(_, t)| !t.is_empty() && !message.contains(*t)) {
             message += &format!(" ({text})");
         }
-        // A light function named without the key, or outside the stages that trace.
-        let light = |n: &&str| message.contains(&format!("`{n}`"));
+        // A light function named without the key, or outside the stages that trace: undefined.
+        let light =
+            |n: &&str| e.message() == format!("no definition in scope for identifier: `{n}`");
         if crate::stages::LIGHT_NAMES.iter().any(light) {
             message += "; the light sources are only in the post, compute, `[[before_world]]` \
                         and material stages of a pack with `lights = true` under `[ray_tracing]`";
@@ -1057,7 +1062,7 @@ fn api_rules(module: &naga::Module, kind: StageKind, own: &Composed) -> Vec<Prob
 }
 
 /// The pack's files construct none of the structs Horizon hands a stage (`Frame`, the
-/// stage inputs, the post helpers' `SurfaceData` and `RayHit`). They may gain fields, which would break a
+/// stage inputs, the post helpers' `SurfaceData`, `RayHit` and `RayLight`). They may gain fields, which would break a
 /// positional `PostInput(...)`; reading them and passing them along stay as they are. `Surface`,
 /// which `material` returns, is built.
 fn constructions(module: &naga::Module, own: &Composed) -> Vec<Problem> {
@@ -1070,6 +1075,7 @@ fn constructions(module: &naga::Module, own: &Composed) -> Vec<Problem> {
             COMPUTE_INPUT.name,
             "SurfaceData",
             RAY_HIT.name,
+            "RayLight",
             "MotionData",
         ])
         .collect();

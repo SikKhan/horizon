@@ -207,7 +207,9 @@ fn ray_tracing() -> String {
          - The light sources, only with `lights = true` under `[ray_tracing]` (off by default: without it these five names\n  \
          are free for the pack's own), and only in a stage whose files name one of them outside a comment, which alone\n  \
          binds them. `struct RayLight`: `position: vec3<f32>`, the centre of its block, camera-relative from the player's\n  \
-         camera (`frame.camera_position`) in every pass, as `trace`'s `origin` and `view_position` are; `level: f32`,\n  \
+         camera (`frame.camera_position`) in every pass, as `trace`'s `origin` and `view_position` are (the water mirror\n  \
+         is drawn by Horizon's own terrain shader, and the shadow map with the vertex stage, which can't reach the light\n  \
+         functions: no pass reads them from another camera); `level: f32`,\n  \
          vanilla's light level of the block, 1 to 15 (a terrain hit's `RayHit.emission` times 15); `color: vec3<f32>`,\n  \
          its `[[lights]]` colour decoded to linear as `block_light_color`'s is, white for a block the pack gives none;\n  \
          `material: u32`, its `[[materials]]` id, the one `RayHit.material` reports on the first face of its model whose\n  \

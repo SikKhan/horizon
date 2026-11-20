@@ -1194,6 +1194,15 @@ fn the_light_sources_are_the_keyed_pack_s_that_names_them() {
     assert!(!lit(SHADOWED).unwrap().stages[0].traces_lights());
     let commented = format!("// ray_lights_near\n{SHADOWED}");
     assert!(!lit(&commented).unwrap().stages[0].traces_lights());
+    // `RayLight` may gain fields: the pack reads it, never builds it.
+    let built = "fn post(input: PostInput) -> vec4<f32> {\n    \
+                 let l = RayLight(vec3<f32>(0.0), 1.0, vec3<f32>(1.0), 0u);\n    \
+                 return vec4<f32>(l.color, 1.0);\n}\n";
+    let problems = lit(built).unwrap_err();
+    assert_eq!(
+        refused(&problems, "RayLight"),
+        [("post.wgsl".to_owned(), 2)]
+    );
     for unkeyed in [traced(LIT), post_pack(LIT, TONEMAP, "")] {
         let problems: Vec<String> = unkeyed
             .unwrap_err()
@@ -1270,6 +1279,33 @@ fn a_pack_s_own_ray_light_stays_its_own_without_the_key() {
         problems
             .iter()
             .any(|p| p.contains("redefinition of `ray_light`")),
+        "{problems:#?}"
+    );
+    // The key is set: no hint to set it.
+    assert!(
+        !problems.iter().any(|p| p.contains("lights = true")),
+        "{problems:#?}"
+    );
+}
+
+/// With `lights = true` a material stage that names a light function reads them (binding 80),
+/// and a vertex stage that reaches one is refused as a ray from it is: the shadow map draws
+/// with the vertex stage, so the sources are read only where the player's camera draws.
+#[test]
+fn the_material_reads_the_light_sources_and_the_vertex_stage_doesn_t() {
+    let lit = "fn material(input: MaterialInput) -> Surface {\n    \
+               return Surface(input.albedo * f32(ray_light_count()));\n}\n";
+    let report = traced_material(lit, "lights = true\n", &[]).unwrap();
+    assert!(report.stages[0].traces_lights());
+    let vertex = "fn vertex(input: VertexInput) -> vec3<f32> {\n    \
+                  return input.position * f32(ray_light_count());\n}\n";
+    let keys = "lights = true\n[vertex]\nfile = \"vertex.wgsl\"\n";
+    let problems = traced_material(MATERIAL, keys, &[("vertex.wgsl", vertex)]).unwrap_err();
+    let needle = "`vertex` reaches the light sources: it runs in a vertex shader";
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.file == "vertex.wgsl" && p.message.contains(needle)),
         "{problems:#?}"
     );
 }
