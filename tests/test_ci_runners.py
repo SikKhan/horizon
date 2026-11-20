@@ -151,9 +151,14 @@ class OwnRunnerTests(unittest.TestCase):
 
 
 class HostedParityTests(unittest.TestCase):
-    """parity-hosted.yml fetches the maintainers' encrypted vanilla data onto Blacksmith's runners: the secrets reach
-    one step, and nothing of the data or what is built from it may outlive the runner (a fork's pull request can
-    mount this repository's sticky disks and caches)."""
+    """parity-hosted.yml fetches the maintainers' encrypted vanilla data onto Blacksmith's runners. The secrets reach
+    only the default branch's fetch and seal scripts, never beside the tested commit's code but on main. A fork's pull
+    request can restore this repository's cache entries, so only main's runs write them, and nothing made from the
+    data goes into one, an artifact or a log unsealed: the build folders (no game data) are the only clear entry."""
+
+    SAVE_CACHES = ("  SAVE_CACHES: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('[\"workflow_dispatch\", "
+                   "\"push\", \"schedule\"]'), github.event_name) && 'true' || 'false' }}\n")
+    SECRET_STEPS = ["Fetch the vanilla data", "Unseal the restored caches", "Seal for the caches"]
 
     @classmethod
     def setUpClass(cls):
@@ -162,8 +167,13 @@ class HostedParityTests(unittest.TestCase):
         import yaml
         cls.text = (WORKFLOWS / "parity-hosted.yml").read_text()
         cls.workflow = yaml.safe_load(cls.text)
+        cls.steps = cls.workflow["jobs"]["run"]["steps"]
+        cls.names = [step.get("name") or step.get("uses") for step in cls.steps]
 
-    def test_secret_values_reach_only_the_fetch_step(self):
+    def step(self, name):
+        return self.steps[self.names.index(name)]
+
+    def test_secret_values_reach_only_the_trusted_scripts(self):
         holders = []
         for job, body in self.workflow["jobs"].items():
             self.assertNotIn("secrets.", repr({k: v for k, v in body.items() if k != "steps"}), job)
@@ -172,30 +182,67 @@ class HostedParityTests(unittest.TestCase):
                     holders.append((job, step.get("name"), step.get("env", {})))
         values = [(job, name) for job, name, env in holders if any(
             re.fullmatch(r"\$\{\{ secrets\.\w+ \}\}", str(value)) for value in env.values())]
-        self.assertEqual(values, [("run", "Fetch the vanilla data")])
+        self.assertEqual(values, [("run", name) for name in self.SECRET_STEPS])
         # The plan learns only whether they are set.
         others = [(job, name) for job, name, _ in holders if (job, name) not in values]
         self.assertEqual(others, [("plan", "Access to the vanilla data")])
+        # Each runs the default branch's copies only, never a script of the checkout.
+        for name in self.SECRET_STEPS:
+            run = self.step(name)["run"]
+            self.assertNotIn("tools/", run, name)
+            self.assertNotIn("python", run, name)
+            self.assertTrue(re.findall(r"\bbash (\S+)", run), name)
+            for script in re.findall(r"\bbash (\S+)", run):
+                self.assertRegex(script, r'^"\$RUNNER_TEMP/trusted/[a-z-]+\.sh"$', name)
 
-    def test_nothing_is_cached_or_kept(self):
-        steps = [step for body in self.workflow["jobs"].values() for step in body["steps"]]
-        for step in steps:
-            uses = step.get("uses", "")
-            self.assertFalse(re.search(r"cache|sticky|useblacksmith/", uses), uses)
-            self.assertEqual([key for key in step.get("with", {}) if "cache" in key], [], uses or step.get("name"))
-        self.assertEqual(self.workflow["jobs"]["run"]["env"]["HORIZON_NO_SCCACHE"], "1")
-        uploads = [step["with"]["path"] for step in steps if "upload-artifact" in step.get("uses", "")]
-        self.assertEqual(uploads, ["${{ runner.temp }}/parity-hosted-logs/"])
-
-    def test_the_data_is_fetched_before_the_tested_commit_is_checked_out(self):
+    def test_the_secrets_meet_no_tested_code_but_mains(self):
         # Before the checkout the workspace is empty: no code of the tested commit can run beside the secrets.
-        names = [step.get("name") or step.get("uses") for step in self.workflow["jobs"]["run"]["steps"]]
-        checkout = next(index for index, name in enumerate(names) if name.startswith("actions/checkout@"))
-        self.assertLess(names.index("Fetch the vanilla data"), checkout)
+        checkout = next(index for index, name in enumerate(self.names) if name.startswith("actions/checkout@"))
+        self.assertLess(self.names.index("Fetch the vanilla data"), checkout)
+        self.assertLess(self.names.index("Unseal the restored caches"), checkout)
+        # Sealing comes after the harnesses: on main only, whose code it is.
+        self.assertGreater(self.names.index("Seal for the caches"), self.names.index("The shard's harnesses"))
+        self.assertIn("env.SAVE_CACHES == 'true'", self.step("Seal for the caches")["if"])
         self.assertEqual(set(self.workflow[True]), {"workflow_dispatch"})
-        # The default branch's copy of the fetch script, or none: never the tested commit's.
-        script = self.workflow["jobs"]["run"]["steps"][names.index("The fetch script, from the default branch")]["run"]
-        self.assertEqual(re.findall(r"ref=\S+", script), ['ref=$TRUSTED_REF"'])
+        # The default branch's copies of the scripts, or none: never the tested commit's.
+        script = self.step("The fetch and seal scripts, from the default branch")["run"]
+        self.assertEqual(re.findall(r"ref=\S+", script), ['ref=$TRUSTED_REF"'] * 2)
+        self.assertEqual(self.step("The fetch and seal scripts, from the default branch")["env"]["TRUSTED_REF"],
+                         "${{ github.event.repository.default_branch }}")
+        # What the plan job (the tested tree) gives the keys is checked before it names anything.
+        self.assertIn("the plan's keys are not what it computes", self.step("Cache keys")["run"])
+
+    def test_only_mains_runs_save(self):
+        self.assertIn(self.SAVE_CACHES, self.text)
+        gates = {"owned": "Only Cargo wrote into the build folders", "seal": "Seal for the caches"}
+        for name in gates.values():
+            self.assertIn("env.SAVE_CACHES == 'true'", self.step(name)["if"], name)
+        saves = [step for step in self.steps if step.get("uses", "").startswith("actions/cache/save@")]
+        self.assertEqual(len(saves), 4)
+        for step in saves:
+            condition = step["if"]
+            self.assertTrue("env.SAVE_CACHES == 'true'" in condition
+                            or any(f"steps.{id}.outputs." in condition for id in gates), step["name"])
+        # No action that restores and saves at once, no sticky disk, no compiler cache.
+        for body in self.workflow["jobs"].values():
+            for step in body["steps"]:
+                uses = step.get("uses", "")
+                self.assertFalse(re.search(r"^actions/cache@|sticky|useblacksmith/|rust-cache", uses), uses)
+        self.assertEqual(self.workflow["jobs"]["run"]["env"]["HORIZON_NO_SCCACHE"], "1")
+
+    def test_only_the_build_folders_are_cached_in_the_clear(self):
+        clear = {".local/parity-target", "target"}
+        for step in self.steps:
+            if step.get("uses", "").startswith("actions/cache/"):
+                paths = {line.strip() for line in step["with"]["path"].splitlines() if line.strip()}
+                # The encrypted dataset's chunks as they are; everything else made from the data sealed.
+                self.assertTrue(paths == clear or paths == {"${{ env.VANILLA_DATA_CACHE }}"}
+                                or all(path.startswith("${{ env.SEALED }}/") for path in paths), step["name"])
+        uploads = [step["with"]["path"] for step in self.steps if "upload-artifact" in step.get("uses", "")]
+        self.assertEqual(uploads, ["${{ runner.temp }}/parity-hosted-logs/"])
+        # Before main saves them in the clear, nothing but Cargo may have written into them.
+        self.assertIn("tools/ci/cargo_owned.py check", self.step("Only Cargo wrote into the build folders")["run"])
+        self.assertEqual(self.step("Save the build folders")["if"], "${{ !cancelled() && steps.owned.outputs.clear == 'true' }}")
 
     def test_no_required_check_waits_for_it(self):
         for path in sorted(WORKFLOWS.glob("*.yml")):

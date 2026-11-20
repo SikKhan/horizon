@@ -1,7 +1,8 @@
 name: parity-hosted
 # The vanilla harnesses on Blacksmith's runners instead of the Mac mini (docs/ci-runners.md#hosted-parity): the vanilla
 # data comes encrypted from the maintainers' private repository horizon-rust/vanilla-data; Horizon's code still never
-# downloads the game. Advisory for now: nothing waits for it, and its result is not the Mac's `parity / parity`.
+# downloads the game. Advisory for now: nothing waits for it, and its result is not the Mac's `parity / parity`. Runs
+# start from caches that only runs of main write; what is made from the data is sealed in them (see the run job).
 # Started by hand: gh workflow run parity-hosted.yml --ref <branch> -f harnesses="food light" (or -f base=<commit>).
 on:
   workflow_dispatch:
@@ -19,6 +20,10 @@ permissions:
 env:
   # Test runs never reach the telemetry server: no live-count ping, no uploads (docs/telemetry.md).
   HORIZON_TELEMETRY_URL: "off"
+  # Only a run of main writes the caches every other run starts from (docs/ci-runners.md#hosted-parity). Today the
+  # only such run is a dispatch on main; the allow-list keeps an event that reports main's ref for another's code (a
+  # pull_request_target) out if a trigger is added.
+  SAVE_CACHES: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["workflow_dispatch", "push", "schedule"]'), github.event_name) && 'true' || 'false' }}
 
 jobs:
   # Which harnesses, on how many runners: no secret and no game data here.
@@ -33,6 +38,9 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       shards: ${{ steps.plan.outputs.shards }}
       left_out: ${{ steps.plan.outputs.left_out }}
+      java: ${{ steps.keys.outputs.java }}
+      lock: ${{ steps.keys.outputs.lock }}
+      prepare: ${{ steps.keys.outputs.prepare }}
     steps:
       # First, so nothing else can fail before it: a run without the data's secrets (a fork's, Dependabot's) runs
       # nothing, and `hosted parity (advisory)` fails saying so. Only whether they are set reaches this job.
@@ -82,6 +90,18 @@ jobs:
             echo "::warning::head ${HEAD_SHA:0:9} conflicts with main ${main:0:9}: tested alone, without main's fixes"
             echo "Tested: head ${HEAD_SHA:0:9} alone (it conflicts with main ${main:0:9})" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+      # What the run jobs need from the tested tree before they check it out: they fetch and unseal first (no code of
+      # the tested commit may run beside the passphrase), and validate these. The preparer's key is vanilla-data.sh's.
+      - name: The JDK, Cargo.lock and the preparer's key, for the run jobs
+        id: keys
+        if: steps.access.outputs.data == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "java=$(sed -n 's/.*"java_major": *\([0-9]*\).*/\1/p' research-lock.json | head -1)"
+            echo "lock=$(sha256sum < Cargo.lock | cut -c1-12)"
+            echo "prepare=$(git ls-files -s crates/horizon-prepare mods/horizon/src/test/java research-lock.json tools/ci/vanilla-data.sh tools/ci/seed_prepared_extras.py tools/prepare_output.py | sha256sum | cut -c1-16)"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: steps.access.outputs.data == 'true'
         with:
@@ -113,7 +133,12 @@ jobs:
           import json, os
           plan = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "plan.json")))
           shards = [shard for shard in plan["shards"] if shard["harnesses"]]
-          include = [{"shard": index, "of": len(shards), "group": shard["group"], "harnesses": " ".join(shard["harnesses"])}
+          # A group's first shard alone saves its build folders on main: one entry per group, not one per shard.
+          first = {}
+          for index, shard in enumerate(shards, 1):
+              first.setdefault(shard["group"], index)
+          include = [{"shard": index, "of": len(shards), "group": shard["group"], "harnesses": " ".join(shard["harnesses"]),
+                      "saves_build": first[shard["group"]] == index}
                      for index, shard in enumerate(shards, 1)]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"matrix={json.dumps({'include': include})}\n")
@@ -122,7 +147,10 @@ jobs:
           EOF
 
   # One shard: the data, the shard's probes and its harnesses, on a 16-vCPU runner with no GPU (Xvfb and Mesa's
-  # software Vulkan for the harnesses that start the game). Cold every time: nothing of it is cached or kept.
+  # software Vulkan for the harnesses that start the game). It starts from main's caches (docs/ci-runners.md#hosted-
+  # parity): the build folders in the clear (no game data in them); the dataset's encrypted chunks as they are; the
+  # prepared resources, oracle results and parity state sealed and authenticated by tools/ci/sealed-cache.sh. Only a
+  # run of main (SAVE_CACHES) writes any of them.
   run:
     name: hosted parity ${{ matrix.shard }}/${{ matrix.of }} (${{ matrix.group }})
     needs: plan
@@ -133,14 +161,18 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      # No compiler cache: no cache may hold what this job builds from the game's data.
+      # No compiler cache: sccache would keep what this job builds where nothing checks it.
       HORIZON_NO_SCCACHE: "1"
       CARGO_BUILD_JOBS: "16"
+      # dtolnay/rust-toolchain sets 0 when it is unset, which turns off the profiles' incremental builds: a cached
+      # build then recompiles a changed crate whole (a one-line gameplay change: 162 s instead of 19 s).
+      CARGO_INCREMENTAL: "1"
       PARITY_LOCAL_JOBS: "8"
       PARITY_MACHINE_JOBS: "8"
       PARITY_HOSTS: ''
       # A harness retried after a first failure keeps that run's log (tools/parity.py): uploaded below.
       PARITY_KEEP_FIRST_LOGS: "1"
+      DATASET: 26.3-linux-x64
     steps:
       - name: Folders for the data, outside the checkout
         run: |
@@ -148,10 +180,15 @@ jobs:
             echo "HORIZON_SHARED_SOURCE=$RUNNER_TEMP/vanilla/shared-local"
             echo "HORIZON_PREPARED_CACHE=$RUNNER_TEMP/vanilla/prepared"
             echo "PARITY_SHARED=$RUNNER_TEMP/vanilla/parity-shared"
+            echo "VANILLA_DATA_CACHE=$RUNNER_TEMP/vanilla-encrypted"
+            echo "SEALED=$RUNNER_TEMP/sealed"
+            echo "UNSEALED=$RUNNER_TEMP/unsealed"
           } >> "$GITHUB_ENV"
-      # The data is fetched before the tested commit is checked out or any of its code runs, by the default branch's
-      # copy of the script: the secrets never meet the tested code. Without that copy the job stops.
-      - name: The fetch script, from the default branch
+      # The data is fetched and the caches unsealed before the tested commit is checked out or any of its code runs,
+      # by the default branch's copies of the scripts: the secrets never meet the tested code. Without the fetch
+      # script the job stops; without sealed-cache.sh (a default branch from before it) the run starts cold.
+      - name: The fetch and seal scripts, from the default branch
+        id: trusted
         env:
           GH_TOKEN: ${{ github.token }}
           TRUSTED_REF: ${{ github.event.repository.default_branch }}
@@ -161,13 +198,88 @@ jobs:
           path="repos/$GITHUB_REPOSITORY/contents/tools/ci/fetch-vanilla-data.sh?ref=$TRUSTED_REF"
           gh api -H "Accept: application/vnd.github.raw" "$path" > "$RUNNER_TEMP/trusted/fetch.sh" ||
             { echo "::error::no tools/ci/fetch-vanilla-data.sh on $TRUSTED_REF"; exit 1; }
-      # The only step with the secrets. The script writes them to a private folder and removes it, key and passphrase
-      # with it, before it ends; it prints sizes, counts and timings only.
+          path="repos/$GITHUB_REPOSITORY/contents/tools/ci/sealed-cache.sh?ref=$TRUSTED_REF"
+          if gh api -H "Accept: application/vnd.github.raw" "$path" > "$RUNNER_TEMP/trusted/sealed-cache.sh"; then
+            echo "sealed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no tools/ci/sealed-cache.sh on $TRUSTED_REF: no sealed cache this run"
+          fi
+      # Before the checkout too: the keys below may only come from what the tested commit cannot run.
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ needs.plan.outputs.java }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
+        with:
+          toolchain: stable
+      # Keys. The build folders: the shard's probe group, the toolchain and Cargo.lock, then the commit (restored from
+      # the newest of the same group, toolchain and lock). The oracle results and parity state: their format, the
+      # dataset, the JDK, the toolchain and the runner's folders (the oracle shim keys on absolute paths), then the
+      # group, the commit and the shard. The prepared resources: the preparer's key and the dataset. The plan job's
+      # values come from the tested tree: checked before they name anything.
+      - name: Cache keys
+        id: keys
+        env:
+          GROUP: ${{ matrix.group }}
+          JAVA_MAJOR: ${{ needs.plan.outputs.java }}
+          LOCK: ${{ needs.plan.outputs.lock }}
+          PREPARE: ${{ needs.plan.outputs.prepare }}
+        run: |
+          set -euo pipefail
+          [[ "$GROUP" =~ ^[a-z+]+$ && "$JAVA_MAJOR" =~ ^[0-9]+$ && "$LOCK" =~ ^[0-9a-f]{12}$ && "$PREPARE" =~ ^[0-9a-f]{16}$ ]] ||
+            { echo "::error::the plan's keys are not what it computes"; exit 1; }
+          h() { sha256sum | cut -c1-12; }
+          rust=$(rustc -vV | h)
+          java=$(java -version 2>&1 | h)
+          folders=$(echo "$GITHUB_WORKSPACE $RUNNER_TEMP" | h)
+          {
+            echo "target=parity-target-v1-$GROUP-$rust-$LOCK-"
+            echo "oracle=$java-$rust-$folders-$GROUP-"
+            echo "prepare=$PREPARE"
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore the encrypted dataset
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.VANILLA_DATA_CACHE }}
+          key: parity-dataset-v1-${{ env.DATASET }}-newest
+          restore-keys: parity-dataset-v1-${{ env.DATASET }}-
+      # The only step with the deploy key. The script writes the secrets to a private folder and removes it, key and
+      # passphrase with it, before it ends; it prints sizes, counts and timings only. It takes the restored chunks only
+      # when they match the MANIFEST it reads from the repository, and reports the dataset's digest for the keys.
       - name: Fetch the vanilla data
+        id: fetch
         env:
           VANILLA_DATA_DEPLOY_KEY: ${{ secrets.VANILLA_DATA_DEPLOY_KEY }}
           VANILLA_DATA_PASSPHRASE: ${{ secrets.VANILLA_DATA_PASSPHRASE }}
-        run: bash "$RUNNER_TEMP/trusted/fetch.sh" "$HORIZON_SHARED_SOURCE" 26.3-linux-x64
+        run: bash "$RUNNER_TEMP/trusted/fetch.sh" "$HORIZON_SHARED_SOURCE" "$DATASET"
+      - name: Restore the prepared resources (sealed)
+        id: prepared
+        if: steps.trusted.outputs.sealed == 'true' && steps.fetch.outputs.digest != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SEALED }}/prepared
+          key: parity-prepared-v1-${{ steps.keys.outputs.prepare }}-${{ steps.fetch.outputs.digest }}
+      - name: Restore the oracle results and parity state (sealed)
+        id: oracle
+        if: steps.trusted.outputs.sealed == 'true' && steps.fetch.outputs.digest != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SEALED }}/oracle
+          key: parity-oracle-v1-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}${{ github.sha }}-${{ matrix.shard }}
+          restore-keys: parity-oracle-v1-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}
+      # The passphrase's second step: an entry whose authentication tag fails is discarded with a warning (the run
+      # goes on without it), never decrypted. What it holds goes to a stage, copied into place after the checkout.
+      - name: Unseal the restored caches
+        if: steps.trusted.outputs.sealed == 'true' && steps.fetch.outputs.digest != ''
+        env:
+          VANILLA_DATA_PASSPHRASE: ${{ secrets.VANILLA_DATA_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          for label in prepared oracle; do
+            VANILLA_DATA_PASSPHRASE="$VANILLA_DATA_PASSPHRASE" bash "$RUNNER_TEMP/trusted/sealed-cache.sh" unseal \
+              "$label" "$SEALED/$label/archive" "$UNSEALED/$label"
+            rm -rf "${SEALED:?}/$label"
+          done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.head }}
@@ -182,15 +294,32 @@ jobs:
             git fetch -q --no-tags origin "$MAIN_SHA"
             git -c user.name=parity -c user.email=parity@localhost merge -q --no-edit --no-ff "$MAIN_SHA"
           fi
-      - name: The JDK research-lock.json pins
-        id: lock
+      # Dates kept to the nanosecond: the oracle shim replays a run only while its outputs keep theirs.
+      - name: The unsealed files into place
         run: |
-          echo "java=$(sed -n 's/.*"java_major": *\([0-9]*\).*/\1/p' research-lock.json | head -1)" >> "$GITHUB_OUTPUT"
-      # What tools/ci/linux-runner.sh installs on Ubuntu, the screen included (Xvfb, Mesa's lavapipe), less sccache.
+          set -euo pipefail
+          shopt -s nullglob
+          for stage in "$UNSEALED"/*/; do
+            for root in "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; do
+              if [ -d "${stage%/}$root" ]; then cp -a "${stage%/}$root/." "$root/"; fi
+            done
+          done
+          rm -rf "$UNSEALED"
+      - name: Restore the build folders
+        id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .local/parity-target
+            target
+          key: ${{ steps.keys.outputs.target }}${{ github.sha }}
+          restore-keys: ${{ steps.keys.outputs.target }}
+      # What tools/ci/linux-runner.sh installs on Ubuntu, the screen included (Xvfb, Mesa's lavapipe), less sccache,
+      # and less what the image has (gcc, make; no crate builds with cmake).
       - name: Build and screen packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config cmake libasound2-dev libudev-dev \
+          sudo apt-get install -y -qq --no-install-recommends pkg-config libasound2-dev libudev-dev \
             mesa-vulkan-drivers libvulkan1 xvfb x11-utils libx11-6 libxcursor1 libxrandr2 libxi6 libxinerama1 \
             libxkbcommon0 libxkbcommon-x11-0 libgl1 libegl1 > /dev/null
       - name: A virtual screen with software Vulkan
@@ -204,15 +333,21 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
-      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
-        with:
-          distribution: temurin
-          java-version: ${{ steps.lock.outputs.java }}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
-        with:
-          toolchain: stable
       - name: Tools from the runner
         run: bash tools/ci/runner-env.sh
+      # A checkout dates every file now: files whose Git object is the one the restored build saw get that build's
+      # dates back (as tools/ci/build_folder.sh does for the sticky disks), so Cargo rebuilds only what changed. On
+      # main, what the build folders hold now is noted: only Cargo may add to them before they are saved.
+      - name: Source dates of the restored build
+        env:
+          SAVES_BUILD: ${{ env.SAVE_CACHES == 'true' && matrix.saves_build && steps.target.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .local/parity-target target
+          python3 tools/ci/source_mtimes.py .local/parity-target/source-mtimes-v1.json
+          if [ "$SAVES_BUILD" = true ]; then
+            python3 tools/ci/cargo_owned.py snapshot "$RUNNER_TEMP/cargo-owned.json" .local/parity-target target
+          fi
       - name: Vanilla data, and resources prepared by this preparer
         run: bash tools/ci/vanilla-data.sh
       # The oracles' shims (tools/parity_shim.py) share one hash database. On a cold cache the first ones all create
@@ -223,6 +358,7 @@ jobs:
           PARITY_SHIM_CACHE="$PWD/.local/parity-runner/oracle-cache" \
             python3 -c 'import sys; sys.path.insert(0, "tools"); import parity_shim; parity_shim.Hashes()'
       - name: The shard's harnesses
+        id: harnesses
         env:
           HARNESSES: ${{ matrix.harnesses }}
         run: |
@@ -267,6 +403,69 @@ jobs:
           path: ${{ runner.temp }}/parity-hosted-logs/
           if-no-files-found: ignore
           retention-days: 3
+      # The saves: main's runs only (SAVE_CACHES), whether its harnesses passed or not, once they ran. An entry whose
+      # exact key exists (the same commit again) is not saved twice. The dataset and the prepared resources are the
+      # same for every shard (the first saves them), the build folders for every shard of a group (its first).
+      - name: Save the encrypted dataset
+        if: ${{ !cancelled() && env.SAVE_CACHES == 'true' && matrix.shard == 1 && steps.fetch.outputs.cache == 'refreshed' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.VANILLA_DATA_CACHE }}
+          key: parity-dataset-v1-${{ env.DATASET }}-${{ steps.fetch.outputs.digest }}
+      # The build folders are saved in the clear: a differential check found nothing of the data in them (2026-11-20),
+      # which holds only while nothing but Cargo writes there.
+      - name: Only Cargo wrote into the build folders
+        id: owned
+        if: ${{ !cancelled() && env.SAVE_CACHES == 'true' && matrix.saves_build && steps.target.outputs.cache-hit != 'true' && steps.harnesses.outcome != 'skipped' }}
+        run: |
+          if python3 tools/ci/cargo_owned.py check "$RUNNER_TEMP/cargo-owned.json" .local/parity-target target; then
+            echo "clear=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::the build folders are not saved: something besides Cargo wrote into them"
+          fi
+      - name: Save the build folders
+        if: ${{ !cancelled() && steps.owned.outputs.clear == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .local/parity-target
+            target
+          key: ${{ steps.keys.outputs.target }}${{ github.sha }}
+      # The passphrase's third step, on main only, where the tested code is main's own. Every real folder in .local/
+      # but the build (the rest are links to the data), and parity.py's shared passes; the prepared resources once.
+      - name: Seal for the caches
+        id: seal
+        if: ${{ !cancelled() && env.SAVE_CACHES == 'true' && steps.trusted.outputs.sealed == 'true' && steps.fetch.outputs.digest != '' && steps.harnesses.outcome != 'skipped' }}
+        env:
+          VANILLA_DATA_PASSPHRASE: ${{ secrets.VANILLA_DATA_PASSPHRASE }}
+          SEAL_PREPARED: ${{ matrix.shard == 1 && steps.prepared.outputs.cache-hit != 'true' }}
+          SEAL_ORACLE: ${{ steps.oracle.outputs.cache-hit != 'true' }}
+          PREPARE: ${{ steps.keys.outputs.prepare }}
+        run: |
+          set -euo pipefail
+          if [ "$SEAL_PREPARED" = true ] && [ -d "$HORIZON_PREPARED_CACHE/prepared/$PREPARE" ]; then
+            VANILLA_DATA_PASSPHRASE="$VANILLA_DATA_PASSPHRASE" bash "$RUNNER_TEMP/trusted/sealed-cache.sh" seal \
+              prepared "$SEALED/prepared/archive" "$HORIZON_PREPARED_CACHE/prepared/$PREPARE"
+            echo "prepared=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$SEAL_ORACLE" = true ]; then
+            mapfile -t folders < <(find .local -mindepth 1 -maxdepth 1 -type d ! -name parity-target -printf "$PWD/%p\n")
+            VANILLA_DATA_PASSPHRASE="$VANILLA_DATA_PASSPHRASE" bash "$RUNNER_TEMP/trusted/sealed-cache.sh" seal \
+              oracle "$SEALED/oracle/archive" "${folders[@]}" "$PARITY_SHARED"
+            echo "oracle=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save the prepared resources (sealed)
+        if: ${{ !cancelled() && steps.seal.outputs.prepared == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SEALED }}/prepared
+          key: parity-prepared-v1-${{ steps.keys.outputs.prepare }}-${{ steps.fetch.outputs.digest }}
+      - name: Save the oracle results and parity state (sealed)
+        if: ${{ !cancelled() && steps.seal.outputs.oracle == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SEALED }}/oracle
+          key: parity-oracle-v1-${{ steps.fetch.outputs.digest }}-${{ steps.keys.outputs.oracle }}${{ github.sha }}-${{ matrix.shard }}
 
   # The job to read: it fails when hosted parity failed or did not run at all.
   result:

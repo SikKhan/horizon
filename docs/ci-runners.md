@@ -126,15 +126,31 @@ gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>               
   - It holds them encrypted (AES-256, zstd) in datasets made with `lab.py prepare`. Today there is one,
     `26.3-linux-x64`: the jars and libraries, without sources, sounds or other languages.
   - A read-only deploy key (`VANILLA_DATA_DEPLOY_KEY`) clones it, and `VANILLA_DATA_PASSPHRASE` decrypts it.
-  - Those two secrets reach one step, which runs `tools/ci/fetch-vanilla-data.sh`. The script writes them to a
-    private folder, removes that folder before it ends, and prints only sizes, counts and timings.
-  - That step runs before the tested commit is checked out, with the default branch's copy of the script: the
-    secrets never meet the tested commit's code. Without that copy the shard stops. The workflow file itself comes
-    from the dispatched ref, so who may dispatch (write access) is still the guard against a branch that edits it.
+  - Those two secrets reach the step that runs `tools/ci/fetch-vanilla-data.sh`, and the passphrase also reaches
+    the steps that run `tools/ci/sealed-cache.sh` (below). The scripts write them to a private folder, remove that
+    folder before they end, and print only sizes, counts and timings.
+  - Fetching and unsealing run before the tested commit is checked out, with the default branch's copies of the
+    scripts: the secrets never meet the tested commit's code. Sealing runs after the harnesses, on main only, whose
+    code it is. Without the fetch script the shard stops; without `sealed-cache.sh` it starts cold. The workflow
+    file itself comes from the dispatched ref, so who may dispatch (write access) is still the guard against a
+    branch that edits it.
   - Only a commit on a branch of this repository runs, resolved once to a full SHA that every job uses.
-- **What never leaves the runner.** The data, what is prepared from it, `target/` and `.local/` are never put on a
-  sticky disk, in a cache (no `actions/cache`, no sccache) or in an artifact: a fork's pull request can mount this
-  repository's disks and caches. Everything is built cold and thrown away with the runner.
+- **Caches.** A fork's pull request can restore this repository's cache entries, and a branch's copy of the workflow
+  can name any key. So only a run of main writes them (`SAVE_CACHES`: today a dispatch on main), and what is made from
+  the data goes into one only sealed. Every other run restores and saves nothing. No sticky disk, no sccache.
+  - The build folders (`.local/parity-target`, `target/`), in the clear, one entry per probe group, keyed by the
+    toolchain and `Cargo.lock` and restored from the newest. A differential check (2026-11-20) found nothing of the
+    data in them. Main saves them only when `tools/ci/cargo_owned.py` finds that nothing but Cargo wrote there
+    during the run. Incremental builds are on (`CARGO_INCREMENTAL=1`) and `tools/ci/source_mtimes.py` gives
+    unchanged sources their old dates, so a change rebuilds only what it touches.
+  - The dataset's encrypted chunks, as they are. The fetch script takes them only when they match the MANIFEST it
+    reads from `horizon-rust/vanilla-data` each run, and downloads the dataset otherwise.
+  - The prepared resources, and the oracle results with the parity state, sealed by `tools/ci/sealed-cache.sh`:
+    tar, zstd, the dataset's own encryption (AES-256-CBC, PBKDF2), then HMAC-SHA256 over the ciphertext with a
+    second key derived from the passphrase. Unsealing checks the tag before it decrypts. An entry that fails is
+    discarded with a warning, and the run goes on without it.
+- **What never leaves the runner** unsealed: the data, what is prepared from it, and `.local/` but the build. None
+  of it goes into an artifact.
 - **What is public.** The job logs and the uploaded logs hold what `parity.yml`'s public runs already show: compared
   values, log tails and harness names. That is the only exception to "sizes, counts and timings only", which the
   fetch step keeps. The upload holds the first run's log of each retried harness, the last log of each that failed,
@@ -155,10 +171,13 @@ gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>               
   - the harnesses the `hosted` entry of `tools/parity_hosts.json` excludes: sounds, other languages, sources, older
     servers' worlds, the network;
   - `known_failing` and `named_only` ones.
-- **Cost, measured 2026-11-19.**
+- **Cost, measured 2026-11-19 (cold).**
   - About a minute of setup and data per runner.
   - Cold probe builds: world 40 s; client 530 s (two profiles); the game 480 s.
   - Then 3-10 s of runner time per harness, 8 at a time, most of it in the vanilla oracle.
+  - From main's caches, the builds take seconds, or what a change touches. The cached state serves the probes'
+    prebuild and the oracle results' reuse, not the selection: the plan job holds no secret, and its dependency
+    lists are still to come from a hosted full run on main.
 
 ## Which jobs, and when
 
