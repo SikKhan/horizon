@@ -984,6 +984,11 @@ impl<'a> ComponentNbt<'a> {
             .map(|(key, tag)| {
                 let key = key.to_string().map_err(|_| Error::InvalidString)?;
                 let value = match (kind, action.as_str(), key.as_str()) {
+                    ("click_event", "change_page", "page") => match tag {
+                        // NbtOps narrows long numbers with Java Number.intValue().
+                        Tag::Long(page) => Value::from(*page as i32),
+                        _ => json_nbt::tag_to_json(tag).map_err(error)?,
+                    },
                     ("click_event", "custom", "payload")
                     | ("click_event", "show_dialog", "dialog")
                     | ("hover_event", "show_item", "components") => self.stash(tag),
