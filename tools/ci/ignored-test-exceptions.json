@@ -18,6 +18,14 @@
   {
     "package": "horizon-client",
     "target": "lib",
+    "test": "game::native_text_nbt::tests::vanilla_nbt_oracle",
+    "path": "crates/horizon-client/src/game/modding/native_text_nbt.rs",
+    "reason": "vanilla parity harness",
+    "rationale": "Run by tools/test_native_text_nbt_parity.py, which supplies the test cases and vanilla oracle output through HORIZON_TEXT_NBT_CASES and HORIZON_TEXT_NBT_ORACLE. Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
     "test": "game::attachment_instruction_bench::attachment_instruction_count",
     "path": "crates/horizon-client/src/game/modding/attachment_instruction_bench.rs",
     "reason": "callgrind fixture; needs HORIZON_TEST_RESOURCES",
